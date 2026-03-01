@@ -112,6 +112,7 @@ def _sample(
     logits_processor: LogitsProcessorList,
     stopping_criteria: StoppingCriteriaList,
     generation_config: GenerationConfig,
+    tokenizer: Optional[PreTrainedTokenizerBase] = None,
     synced_gpus: bool = False,
     streamer: Optional["BaseStreamer"] = None,
     **model_kwargs,
@@ -129,7 +130,6 @@ def _sample(
             2.3.3 Update or clear the cache
     """
 
-    tokenizer = model_kwargs.pop('tokenizer')
     thought_token_id = tokenizer.convert_tokens_to_ids("[THOUGHT]")
     solution_token_id = tokenizer.convert_tokens_to_ids("[SOLUTION]")
     return_token_id = tokenizer.convert_tokens_to_ids("[RETURN]")
