@@ -112,7 +112,7 @@ def _sample(
     logits_processor: LogitsProcessorList,
     stopping_criteria: StoppingCriteriaList,
     generation_config: GenerationConfig,
-    tokenizer: Optional[PreTrainedTokenizerBase] = None,
+    processing_class: Optional[PreTrainedTokenizerBase] = None,
     synced_gpus: bool = False,
     streamer: Optional["BaseStreamer"] = None,
     **model_kwargs,
@@ -130,9 +130,9 @@ def _sample(
             2.3.3 Update or clear the cache
     """
 
-    thought_token_id = tokenizer.convert_tokens_to_ids("[THOUGHT]")
-    solution_token_id = tokenizer.convert_tokens_to_ids("[SOLUTION]")
-    return_token_id = tokenizer.convert_tokens_to_ids("[RETURN]")
+    thought_token_id = processing_class.convert_tokens_to_ids("[THOUGHT]")
+    solution_token_id = processing_class.convert_tokens_to_ids("[SOLUTION]")
+    return_token_id = processing_class.convert_tokens_to_ids("[RETURN]")
 
     pad_token_id = generation_config._pad_token_tensor # type: ignore
     has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
@@ -284,11 +284,11 @@ def _sample(
     return input_ids
 
 
-def generate(model, tokenizer = None, **kwargs):
+def generate(model, processing_class = None, **kwargs):
     """Custom generate method for Hierarchical Chain of Thought"""
 
     return model.generate(
         custom_generate=_sample,
-        tokenizer=tokenizer,
+        processing_class=processing_class,
         **kwargs
     )
