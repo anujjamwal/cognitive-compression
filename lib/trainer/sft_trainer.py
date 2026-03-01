@@ -1,5 +1,5 @@
 from dataclasses import field
-from typing import Any, Callable
+from typing import Any
 import torch
 from torch import nn
 from transformers import Trainer, AutoProcessor, PreTrainedModel, PreTrainedTokenizerBase, TrainingArguments
@@ -9,19 +9,19 @@ from trl.trainer.utils import get_config_model_id
 import utils
 
 class HCotSFTConfig(trainer.sft_config.SFTConfig):
-    thought_token: str | None = field(
+    thought_token: str | list[str] | None = field(
         default=None,
         metadata={
             "help": "Token used for marking start of thought."
         },
     )
-    solution_token: str | None = field(
+    solution_token: str | list[str] | None = field(
         default=None,
         metadata={
             "help": "Token used for marking start of thought."
         },
     )
-    return_token: str | None = field(
+    return_token: str | list[str] | None = field(
         default=None,
         metadata={
             "help": "Token used for marking start of thought."
