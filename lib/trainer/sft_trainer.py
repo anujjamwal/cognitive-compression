@@ -8,38 +8,15 @@ from trl import trainer
 from trl.trainer.utils import get_config_model_id
 import utils
 
-class HCotSFTConfig(trainer.sft_config.SFTConfig):
-    thought_token: str | list[str] | None = field(
-        default=None,
-        metadata={
-            "help": "Token used for marking start of thought."
-        },
-    )
-    solution_token: str | list[str] | None = field(
-        default=None,
-        metadata={
-            "help": "Token used for marking start of thought."
-        },
-    )
-    return_token: str | list[str] | None = field(
-        default=None,
-        metadata={
-            "help": "Token used for marking start of thought."
-        },
-    )
-
 
 class HCotSFTTrainer(trainer.sft_trainer.SFTTrainer):
     def __init__(
         self, 
         model: PreTrainedModel,
-        args: HCotSFTConfig | trainer.sft_config.SFTConfig | TrainingArguments | None = None,
+        args: trainer.sft_config.SFTConfig | TrainingArguments | None = None,
         processing_class: PreTrainedTokenizerBase | ProcessorMixin | None = None,
         **kwargs
     ):
-        if processing_class is None:
-            processing_class = AutoProcessor.from_pretrained(get_config_model_id(model.config))
-        
         if isinstance(processing_class, ProcessorMixin):
             tokenizer = processing_class.tokenizer # type: ignore
         elif isinstance(processing_class, PreTrainedTokenizerBase):
@@ -47,24 +24,9 @@ class HCotSFTTrainer(trainer.sft_trainer.SFTTrainer):
         else:
             raise TypeError("The `processing_class` must be either a `PreTrainedTokenizerBase` or a `ProcessorMixin`")
 
-        if hasattr(args, 'thought_token'):
-            thought_token = getattr(args, 'thought_token', '[THOUGHT]')
-        else:
-            thought_token = '[THOUGHT]'
-
-        if hasattr(args, 'solution_token'):
-            solution_token = getattr(args, 'solution_token', '[SOLUTION]')
-        else:
-            solution_token = '[SOLUTION]'
-
-        if hasattr(args, 'return_token'):
-            return_token = getattr(args, 'return_token', '[RETURN]')
-        else:
-            return_token = '[RETURN]'
-
-        self.thought_token_id = tokenizer.convert_tokens_to_ids(thought_token)
-        self.solution_token_id = tokenizer.convert_tokens_to_ids(solution_token)
-        self.return_token_id = tokenizer.convert_tokens_to_ids(return_token)
+        self.thought_token_id = tokenizer.convert_tokens_to_ids("[THOUGHT]")
+        self.solution_token_id = tokenizer.convert_tokens_to_ids("[SOLUTION]")
+        self.return_token_id = tokenizer.convert_tokens_to_ids("[RETURN]")
 
         super().__init__(model, args=args, processing_class=processing_class, **kwargs)
     

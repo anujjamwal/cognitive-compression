@@ -112,6 +112,7 @@ def _sample(
     logits_processor: LogitsProcessorList,
     stopping_criteria: StoppingCriteriaList,
     generation_config: GenerationConfig,
+    tokenizer: PreTrainedTokenizerBase,
     synced_gpus: bool = False,
     streamer: Optional["BaseStreamer"] = None,
     **model_kwargs,
@@ -128,15 +129,6 @@ def _sample(
             2.3.2 Update the position_ids
             2.3.3 Update or clear the cache
     """
-    
-    processing_class = AutoProcessor.from_pretrained(get_config_model_id(model.config))
-    
-    if isinstance(processing_class, ProcessorMixin):
-        tokenizer = processing_class.tokenizer # type: ignore
-    elif isinstance(processing_class, PreTrainedTokenizerBase):
-        tokenizer = processing_class
-    else:
-        raise TypeError("The `processing_class` must be either a `PreTrainedTokenizerBase` or a `ProcessorMixin`")
 
     thought_token_id = tokenizer.convert_tokens_to_ids("[THOUGHT]")
     solution_token_id = tokenizer.convert_tokens_to_ids("[SOLUTION]")
@@ -223,7 +215,6 @@ def _sample(
         # update generated ids, model inputs, and length for next step
         input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1) # type: ignore
 
-        print(tokenizer.decode(next_tokens))
         if streamer is not None:
             streamer.put(next_tokens.cpu())
         
