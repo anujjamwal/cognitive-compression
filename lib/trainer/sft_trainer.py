@@ -80,7 +80,7 @@ class HCotSFTTrainer(trainer.sft_trainer.SFTTrainer):
 
         # Create the default mask with lower triangle
         causal = torch.tril(
-            torch.ones(seq_len, seq_len, dtype=torch.bool)
+            torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
         )
 
         padding_mask = inputs['attention_mask']
