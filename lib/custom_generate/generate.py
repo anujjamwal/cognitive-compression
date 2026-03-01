@@ -284,10 +284,11 @@ def _sample(
     return input_ids
 
 
-def generate(model, **kwargs):
+def generate(model, tokenizer = None, **kwargs):
     """Custom generate method for Hierarchical Chain of Thought"""
 
     return model.generate(
         custom_generate=_sample,
+        tokenizer=tokenizer,
         **kwargs
     )
