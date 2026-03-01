@@ -52,7 +52,7 @@ class HCotSFTTrainer(trainer.sft_trainer.SFTTrainer):
         else:
             thought_token = '[THOUGHT]'
 
-        if hasattr(args, 'thought_token'):
+        if hasattr(args, 'solution_token'):
             solution_token = getattr(args, 'solution_token', '[SOLUTION]')
         else:
             solution_token = '[SOLUTION]'
@@ -109,7 +109,7 @@ class HCotSFTTrainer(trainer.sft_trainer.SFTTrainer):
         num_items_in_batch: torch.Tensor | int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, Any]:
 
-        inputs['attention_mask'] = self._prepare_attention_mask(model, inputs)
+        inputs['attention_mask'] = self._prepare_attention_mask(inputs)
 
         loss, outputs = Trainer.compute_loss(self, model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
         
