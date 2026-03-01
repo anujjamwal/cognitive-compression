@@ -2,10 +2,14 @@ from typing import Any, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
-from transformers import BaseStreamer, Cache, GenerationConfig, LogitsProcessorList, PreTrainedModel, StoppingCriteriaList
+from transformers import AutoProcessor, Cache, LogitsProcessorList, PreTrainedModel, ProcessorMixin, StoppingCriteriaList
 from transformers.generation.utils import GenerationMixin
+from transformers.generation.configuration_utils import GenerationConfig
+from transformers.generation.streamers import BaseStreamer
 from transformers.utils.generic import ModelOutput
 from transformers import PreTrainedTokenizerBase
+from trl.trainer.utils import get_config_model_id
+
 
 def _prepare_inputs_for_generation(
     model,
@@ -55,13 +59,51 @@ def _prune_model_inputs(
     input_ids: torch.LongTensor,
     model_kwargs: dict[str, Any]
 ) -> Tuple[torch.LongTensor, dict[str, Any]]:
-
-    # Prune input_ids[idx] at locations to torch.cat((tokens[b, :thought_pos+1], tokens[b, solution_pos+1:]))
-    # Prune location_ids at the same locations
-    # Prune attention_mask at the locations
-    # Reshape the tensors after prune
-
-    return input_ids, model_kwargs
+    batch_size = input_ids.shape[0]
+    device = input_ids.device
+ 
+    # Map batch index → (thought_pos, solution_pos) for valid prune targets
+    prune_map: dict[int, Tuple[int, int]] = {}
+    for cand_idx, batch_idx in enumerate(prune_input_candidates):
+        for thought_pos, solution_pos, _return_pos in prune_input_locations[cand_idx]:
+            if solution_pos is not None:
+                prune_map[batch_idx] = (thought_pos, solution_pos)
+ 
+    if not prune_map:
+        return input_ids, model_kwargs
+ 
+    # Build pruned rows per batch element
+    new_rows: list[torch.Tensor] = []
+    for b in range(batch_size):
+        if b in prune_map:
+            thought_pos, solution_pos = prune_map[b]
+            new_rows.append(torch.cat((input_ids[b, :thought_pos + 1], input_ids[b, solution_pos + 1:])))
+        else:
+            new_rows.append(input_ids[b])
+ 
+    # Pad to uniform length
+    max_len = max(r.shape[0] for r in new_rows)
+    pad_id = getattr(model.config, 'pad_token_id', None)
+    if pad_id is None:
+        pad_id = getattr(model.config, 'eos_token_id', 0)
+ 
+    new_input_ids = torch.full((batch_size, max_len), pad_id, dtype=input_ids.dtype, device=device)
+    new_attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
+    for b, r in enumerate(new_rows):
+        new_input_ids[b, :r.shape[0]] = r
+        new_attention_mask[b, :r.shape[0]] = 1
+ 
+    # Discard the KV cache — the next iteration will re-prefill from scratch
+    old_cache = model_kwargs.pop('past_key_values', None)
+    del old_cache
+ 
+    # Reset cache_position to cover the full pruned sequence so that
+    # prepare_inputs_for_generation treats the next forward as a prefill
+    model_kwargs['cache_position'] = torch.arange(max_len, dtype=torch.int64, device=device)
+    model_kwargs['attention_mask'] = new_attention_mask
+ 
+    return new_input_ids, model_kwargs # type: ignore
+ 
 
 
 def _sample(
@@ -86,7 +128,16 @@ def _sample(
             2.3.2 Update the position_ids
             2.3.3 Update or clear the cache
     """
-    tokenizer: PreTrainedTokenizerBase = model_kwargs.get("tokenizer") # type: ignore
+    
+    processing_class = AutoProcessor.from_pretrained(get_config_model_id(model.config))
+    
+    if isinstance(processing_class, ProcessorMixin):
+        tokenizer = processing_class.tokenizer # type: ignore
+    elif isinstance(processing_class, PreTrainedTokenizerBase):
+        tokenizer = processing_class
+    else:
+        raise TypeError("The `processing_class` must be either a `PreTrainedTokenizerBase` or a `ProcessorMixin`")
+
     thought_token_id = tokenizer.convert_tokens_to_ids("[THOUGHT]")
     solution_token_id = tokenizer.convert_tokens_to_ids("[SOLUTION]")
     return_token_id = tokenizer.convert_tokens_to_ids("[RETURN]")
@@ -172,6 +223,7 @@ def _sample(
         # update generated ids, model inputs, and length for next step
         input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1) # type: ignore
 
+        print(tokenizer.decode(next_tokens))
         if streamer is not None:
             streamer.put(next_tokens.cpu())
         
