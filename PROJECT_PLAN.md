@@ -22,6 +22,31 @@ On top of that, We also need to run the benchmarking code to track the actual pr
 
 ## Changelog
 
+### 2026-03-02
+
+#### State
+Positive:
+* The training and inference now perfectly align for prune-aware mode.
+* Prune Aware training now doesn't rely on custom code for Trainer and loss computation. We can simply use the standard `SFTTrainer` in trl package for training.
+
+Negative:
+
+#### Bugfix/Implementation
+
+* Simplify prune aware training: The first implementation of prune aware training would split the example into stages based on the location of the `[RETURN]` token and then call the model and accumulate loss for the complete example. This had two main drawbacks
+  - **Memory Spike**: The training had to keep gradients for each stage and acculate and back propagate. This caused a memory spike
+  - **Over indexing on some tokens**: Because the gradient is summed up, the loss for the tokens in the remaining prefix will receive a gradient that is multiple times a single step. This up-weights the importance of the surviving tokens which can cause issues and require careful tuning.
+  - **Variable length Padding**: Within the example, across the stages, we pad the tokens for efficiency. However a stage with small thought will receive heavy padding that a stage with larger thought. Across the batch, a stage will most likely be smaller than original pad size, which means we unnecessarily add and shrink the tokens here too.
+
+  In order to fix this, for prune aware scenario, we fix by moving the stage creation during data preparation. During preparation, we split examples into stages and flatMap on them which increases the dataset size allowing the trainer to pick uniform number of training examples in a batch. We also fix the over indexing problem by masking the labels for the already processed prefix. This allows the transformer to generate the KV with 4d mask but doesn't accumulate the loss on these tokens.
+
+  As an advantage, we do not need a special Trainer for this and we can simply reuse the standard `SFTTrainer` in the trl class while getting all the results of a prune aware training.
+
+#### Experiments
+
+
+#### Outcome
+
 ### 2026-03-01
 
 #### State
@@ -39,9 +64,6 @@ Negative:
 * Implement two modes in generation, one which resets the position ids and another which retain the position ids. This helps us prepare for AB test on which approach works better for our use case.
 
 #### Experiments
-
-* **A/B Test strategy "Prune Aware" vs "Prune Agnostic" location_ids**
-
 
 #### Outcome
 
