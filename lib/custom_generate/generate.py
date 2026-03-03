@@ -60,7 +60,7 @@ def _prune_model_inputs(
     prune_aware: bool,
     model_kwargs: dict[str, Any],
 ) -> Tuple[torch.LongTensor, dict[str, Any]]:
-    is_prune_agnostic = "position_ids" in model_kwargs and not model_kwargs.get("prune_aware", False)
+    is_prune_agnostic = "position_ids" in model_kwargs and not prune_aware
     position_ids = model_kwargs["position_ids"] if is_prune_agnostic else None
 
     batch_size = input_ids.shape[0]
