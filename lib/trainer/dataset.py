@@ -22,7 +22,7 @@ def convert_to_trl(example, think_key="hierarchical_cot", output_key="expected_a
 
 
 def prepare_prune_aware(
-    example, 
+    batch, 
     tokenizer: PreTrainedTokenizer, 
     thought_token="[THOUGHT]", 
     return_token="[RETURN]", 
@@ -43,54 +43,56 @@ def prepare_prune_aware(
     new_attention_masks = []
     new_labels = []
 
-    trl_template = convert_to_trl(example, think_key=hcot_key, output_key=output_key)
+    for cot, output in zip(batch[hcot_key], batch[output_key]):
 
-    # Convert to messages ensuring completion is at the end of list
-    messages = trl_template["prompt"] + trl_template["completion"]
-    tokenized = tokenizer.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=False,
-        return_dict=True
-    )
+        trl_template = convert_to_trl({hcot_key: cot, output_key: output}, think_key=hcot_key, output_key=output_key)
 
-    input_ids = torch.tensor(tokenized['input_ids'])
-    attention_mask = torch.tensor(tokenized['attention_mask'])
-    labels = input_ids.clone()
+        # Convert to messages ensuring completion is at the end of list
+        messages = trl_template["prompt"] + trl_template["completion"]
+        tokenized = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            return_dict=True
+        )
 
-    # Mask prompt
-    prompt_tokenized = tokenizer.apply_chat_template(
-        trl_template["prompt"],
-        tokenize=True,
-        add_generation_prompt=True
-    )
-    prompt_len = len(prompt_tokenized)
-    labels[:prompt_len] = mask
+        input_ids = torch.tensor(tokenized['input_ids'])
+        attention_mask = torch.tensor(tokenized['attention_mask'])
+        labels = input_ids.clone()
 
-    # Prepare for stages from the hierarchical COT
-    batch_blocks = utils.find_cot_blocks(
-        input_ids.unsqueeze(0),
-        tokenizer.convert_tokens_to_ids(thought_token),
-        tokenizer.convert_tokens_to_ids(solution_token),
-        tokenizer.convert_tokens_to_ids(return_token)
-    )[0]
+        # Mask prompt
+        prompt_tokenized = tokenizer.apply_chat_template(
+            trl_template["prompt"],
+            tokenize=True,
+            add_generation_prompt=True
+        )
+        prompt_len = len(prompt_tokenized)
+        labels[:prompt_len] = mask
 
-    stages = utils.build_stages(input_ids, labels, attention_mask, batch_blocks)
+        # Prepare for stages from the hierarchical COT
+        batch_blocks = utils.find_cot_blocks(
+            input_ids.unsqueeze(0),
+            tokenizer.convert_tokens_to_ids(thought_token),
+            tokenizer.convert_tokens_to_ids(solution_token),
+            tokenizer.convert_tokens_to_ids(return_token)
+        )[0]
 
-    previous_length = 0
-    for stage_ids, stage_labs, stage_mask in stages:
-        stage_labs = stage_labs.clone()
+        stages = utils.build_stages(input_ids, labels, attention_mask, batch_blocks)
 
-        # Mask out the prefill context from previous stages
-        if previous_length > 0:
-            mask_len = min(previous_length, stage_labs.shape[0])
-            stage_labs[:mask_len] = mask
+        previous_length = 0
+        for stage_ids, stage_labs, stage_mask in stages:
+            stage_labs = stage_labs.clone()
 
-        new_input_ids.append(stage_ids.tolist())
-        new_attention_masks.append(stage_mask.tolist())
-        new_labels.append(stage_labs.tolist())
+            # Mask out the prefill context from previous stages
+            if previous_length > 0:
+                mask_len = min(previous_length, stage_labs.shape[0])
+                stage_labs[:mask_len] = mask
 
-        previous_length = stage_ids.shape[0]
+            new_input_ids.append(stage_ids.tolist())
+            new_attention_masks.append(stage_mask.tolist())
+            new_labels.append(stage_labs.tolist())
+
+            previous_length = stage_ids.shape[0]
 
     return {
         "input_ids": new_input_ids,
