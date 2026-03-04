@@ -108,23 +108,25 @@ class HCotSFTTrainer(trainer.sft_trainer.SFTTrainer):
             participating = []
             for b in range(batch_size):
                 if stage_idx < len(all_stages[b]):
-                    participating.append(all_stages[b][stage_idx])
+                    participating.append(b)
 
             if not participating:
                 continue
 
             # Pad to uniform length and stack into a batch
-            max_len = max(ids.shape[0] for ids, _, _ in participating)
+            max_len = max(all_stages[b][stage_idx][0].shape[0] for b in participating)
             n = len(participating)
 
             batch_ids = torch.full((n, max_len), pad_id, dtype=input_ids.dtype, device=device)
-            batch_labels = torch.full((n, max_len), -100, dtype=labels.dtype, device=device)
+            batch_labels = torch.full((n, max_len), -100, dtype=input_ids.dtype, device=device)
             batch_mask = torch.zeros((n, max_len), dtype=attention_mask.dtype, device=device)
 
-            for i, (ids, labs, mask) in enumerate(participating):
-                batch_ids[i, :ids.shape[0]] = ids
-                batch_labels[i, :labs.shape[0]] = labs
-                batch_mask[i, :mask.shape[0]] = mask
+            for local_idx, b_idx in enumerate(participating):
+                s_ids, s_labels, s_mask = all_stages[b_idx][stage_idx]
+
+                batch_ids[local_idx, :s_ids.shape[0]] = s_ids
+                batch_labels[local_idx, :s_labels.shape[0]] = s_labels
+                batch_mask[local_idx, :s_mask.shape[0]] = s_mask
 
             stage_inputs: dict[str, torch.Tensor | Any] = {
                 'input_ids': batch_ids,
