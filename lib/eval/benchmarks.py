@@ -47,6 +47,10 @@ def load_math(
     dataset_id: str = "lighteval/MATH",
     subjects: list[str] | None = None,
     levels: list[int] | None = None,
+    level_key="level",
+    problem_key="problem",
+    subject_key="subject",
+    solution_key="solution"
 ) -> list[EvalProblem]:
     """Load the MATH benchmark and return a list of :class:`EvalProblem`.
 
@@ -70,23 +74,23 @@ def load_math(
 
     problems: list[EvalProblem] = []
     for idx, row in enumerate(ds):
-        if level_strings and row["level"] not in level_strings:
+        if level_strings and row[level_key] not in level_strings:
             continue
-        if subject_set and row["subject"] not in subject_set:
+        if subject_set and row[subject_key] not in subject_set:
             continue
 
-        answer = _extract_boxed(row["solution"])
+        answer = _extract_boxed(row[solution_key])
         if answer is None:
             answer = ""
 
         problems.append(EvalProblem(
             id=f"math_{split}_{idx:05d}",
-            problem=row["problem"],
+            problem=row[problem_key],
             expected_answer=answer,
             metadata={
-                "level": row["level"],
-                "subject": row["subject"],
-                "solution": row["solution"],
+                "level": row[level_key],
+                "subject": row[subject_key],
+                "solution": row[solution_key],
             },
         ))
 
