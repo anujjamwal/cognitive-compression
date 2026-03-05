@@ -40,7 +40,7 @@ except ImportError as exc:
     )
 
 # Difficulty level ordering (top = easiest, low = hardest).
-POLYMATH_LEVELS = ("top", "high", "middle", "low")
+POLYMATH_LEVELS = ("top", "high", "medium", "low")
 
 
 class PolyMathBenchmark:
