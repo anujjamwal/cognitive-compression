@@ -45,16 +45,15 @@ class TestSingleBlock:
         stages = build_stages(self.ids, self.labels, self.mask, self.blocks)
         assert len(stages) == 2
 
-    def test_stage0_is_full_sequence(self):
+    def test_stage0_truncated_at_return(self):
         stages = build_stages(self.ids, self.labels, self.mask, self.blocks)
         ids, labels, mask = stages[0]
-        # Stage 0 uses the full sequence (no pruning yet)
-        assert ids.tolist() == self.ids.tolist()
-        # Loss only for positions 0..7 (up to [RETURN] inclusive)
+        # Stage 0 is truncated at [RETURN] (position 7), inclusive
+        expected_ids = [10, 11, THOUGHT_ID, 12, 13, SOLUTION_ID, 14, RETURN_ID]
+        assert ids.tolist() == expected_ids
+        # Loss for all positions 0..7 (all within range)
         for j in range(8):
-            assert labels[j].item() == self.ids[j].item()
-        for j in range(8, 10):
-            assert labels[j].item() == -100
+            assert labels[j].item() == expected_ids[j]
 
     def test_stage1_pruned_sequence(self):
         stages = build_stages(self.ids, self.labels, self.mask, self.blocks)
@@ -99,22 +98,23 @@ class TestNestedBlocks:
         stages = build_stages(self.ids, self.labels, self.mask, self.blocks)
         assert len(stages) == 3
 
-    def test_stage0_full_sequence_loss_up_to_inner_return(self):
+    def test_stage0_truncated_at_inner_return(self):
         stages = build_stages(self.ids, self.labels, self.mask, self.blocks)
         ids, labels, _ = stages[0]
-        # Full sequence, loss for positions 0..7 (inner [RET2])
-        assert ids.tolist() == self.ids.tolist()
+        # Truncated at inner [RET2] (position 7), inclusive
+        expected_ids = [10, THOUGHT_ID, 12, THOUGHT_ID, 13, SOLUTION_ID, 14, RETURN_ID]
+        assert ids.tolist() == expected_ids
+        # Loss for all positions 0..7 (all within range)
         for j in range(8):
-            assert labels[j].item() == self.ids[j].item()
-        for j in range(8, 13):
-            assert labels[j].item() == -100
+            assert labels[j].item() == expected_ids[j]
 
     def test_stage1_inner_pruned(self):
         stages = build_stages(self.ids, self.labels, self.mask, self.blocks)
         ids, labels, _ = stages[1]
         # Inner block (thought=3, solution=5) pruned: remove positions 4,5 (d, [SOL2])
-        # Kept: 0,1,2,3,6,7,8,9,10,11,12
-        expected_ids = [10, THOUGHT_ID, 12, THOUGHT_ID, 14, RETURN_ID, 15, SOLUTION_ID, 16, RETURN_ID, 17]
+        # Truncated at [RET1] (position 11), inclusive
+        # Kept: 0,1,2,3,6,7,8,9,10,11
+        expected_ids = [10, THOUGHT_ID, 12, THOUGHT_ID, 14, RETURN_ID, 15, SOLUTION_ID, 16, RETURN_ID]
         assert ids.tolist() == expected_ids
         # Loss for original positions 8..11 (between [RET2]+1 and [RET1])
         # Mapped to pruned: orig 8→pruned 6, orig 9→7, orig 10→8, orig 11→9
@@ -124,7 +124,6 @@ class TestNestedBlocks:
         assert labels[7].item() == SOLUTION_ID  # orig 9 = [SOL1]
         assert labels[8].item() == 16   # orig 10
         assert labels[9].item() == RETURN_ID  # orig 11 = [RET1]
-        assert labels[10].item() == -100  # orig 12 → after loss range
 
     def test_stage2_fully_pruned(self):
         stages = build_stages(self.ids, self.labels, self.mask, self.blocks)
@@ -139,6 +138,58 @@ class TestNestedBlocks:
         # Loss for original positions 12+ (after [RET1])
         # Only orig 12 maps to pruned position 4
         assert labels.tolist() == [-100, -100, -100, -100, 17]
+
+
+# ---------------------------------------------------------------------------
+# Nested blocks — comprehensive (all 3 fields per stage)
+# ---------------------------------------------------------------------------
+
+class TestNestedBlocksComprehensive:
+    """A [TH1] c [TH2] d [SOL2] e [RET2] f [SOL1] g [RET1] h
+
+    Same sequence as TestNestedBlocks but verifies input_ids, labels, and
+    attention_mask exhaustively for every stage.
+    """
+
+    def setup_method(self):
+        #               0   1          2   3          4   5           6   7          8   9           10  11          12
+        self.ids = _ids(10, THOUGHT_ID, 12, THOUGHT_ID, 13, SOLUTION_ID, 14, RETURN_ID, 15, SOLUTION_ID, 16, RETURN_ID, 17)
+        self.labels = self.ids.clone()
+        self.mask = torch.ones(13, dtype=torch.long)
+        self.blocks = _find_blocks_1d(self.ids)
+
+    def test_stage0_all_fields(self):
+        """No pruning, truncated at inner [RET2] (pos 7). Length 8."""
+        stages = build_stages(self.ids, self.labels, self.mask, self.blocks)
+        ids, labels, mask = stages[0]
+
+        assert ids.tolist()    == [10, THOUGHT_ID, 12, THOUGHT_ID, 13, SOLUTION_ID, 14, RETURN_ID]
+        assert labels.tolist() == [10, THOUGHT_ID, 12, THOUGHT_ID, 13, SOLUTION_ID, 14, RETURN_ID]
+        assert mask.tolist()   == [1, 1, 1, 1, 1, 1, 1, 1]
+
+    def test_stage1_all_fields(self):
+        """Inner block pruned (remove pos 4,5), truncated at [RET1] (pos 11). Length 10."""
+        stages = build_stages(self.ids, self.labels, self.mask, self.blocks)
+        ids, labels, mask = stages[1]
+
+        assert ids.tolist()    == [10, THOUGHT_ID, 12, THOUGHT_ID, 14, RETURN_ID, 15, SOLUTION_ID, 16, RETURN_ID]
+        assert labels.tolist() == [-100, -100, -100, -100, -100, -100, 15, SOLUTION_ID, 16, RETURN_ID]
+        assert mask.tolist()   == [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+
+    def test_stage2_all_fields(self):
+        """Both blocks pruned (remove pos 2-9), extends to end. Length 5."""
+        stages = build_stages(self.ids, self.labels, self.mask, self.blocks)
+        ids, labels, mask = stages[2]
+
+        assert ids.tolist()    == [10, THOUGHT_ID, 16, RETURN_ID, 17]
+        assert labels.tolist() == [-100, -100, -100, -100, 17]
+        assert mask.tolist()   == [1, 1, 1, 1, 1]
+
+    def test_stage_lengths(self):
+        """Stages should have varying lengths (8, 10, 5), not all ~13."""
+        stages = build_stages(self.ids, self.labels, self.mask, self.blocks)
+        lengths = [s[0].shape[0] for s in stages]
+        assert lengths == [8, 10, 5]
 
 
 # ---------------------------------------------------------------------------
@@ -175,21 +226,23 @@ class TestMultipleNonOverlapping:
         stages = build_stages(self.ids, self.labels, self.mask, self.blocks)
         assert len(stages) == 3
 
-    def test_stage0_loss_up_to_first_return(self):
+    def test_stage0_truncated_at_first_return(self):
         stages = build_stages(self.ids, self.labels, self.mask, self.blocks)
-        _, labels, _ = stages[0]
-        # Loss for positions 0..5 ([RET1] at pos 5)
+        ids, labels, _ = stages[0]
+        # Truncated at [RET1] (position 5), inclusive
+        expected_ids = [10, THOUGHT_ID, 12, SOLUTION_ID, 13, RETURN_ID]
+        assert ids.tolist() == expected_ids
+        # Loss for all positions 0..5 (all within range)
         for j in range(6):
-            assert labels[j].item() == self.ids[j].item()
-        for j in range(6, 13):
-            assert labels[j].item() == -100
+            assert labels[j].item() == expected_ids[j]
 
     def test_stage1_first_block_pruned(self):
         stages = build_stages(self.ids, self.labels, self.mask, self.blocks)
         ids, labels, _ = stages[1]
         # Block 1 (thought=1, solution=3) pruned: remove positions 2,3 (c, [SOL1])
-        # Kept: 0,1,4,5,6,7,8,9,10,11,12
-        expected_ids = [10, THOUGHT_ID, 13, RETURN_ID, 11, THOUGHT_ID, 14, SOLUTION_ID, 15, RETURN_ID, 16]
+        # Truncated at [RET2] (position 11), inclusive
+        # Kept: 0,1,4,5,6,7,8,9,10,11
+        expected_ids = [10, THOUGHT_ID, 13, RETURN_ID, 11, THOUGHT_ID, 14, SOLUTION_ID, 15, RETURN_ID]
         assert ids.tolist() == expected_ids
         # Loss for original positions 6..11 (between [RET1]+1 and [RET2])
         # orig 6→pruned 4, ..., orig 11→pruned 9
@@ -197,7 +250,6 @@ class TestMultipleNonOverlapping:
             assert labels[j].item() == -100
         assert labels[4].item() == 11   # orig 6 = B
         assert labels[9].item() == RETURN_ID  # orig 11 = [RET2]
-        assert labels[10].item() == -100  # orig 12 → after loss range
 
     def test_stage2_both_pruned(self):
         stages = build_stages(self.ids, self.labels, self.mask, self.blocks)
