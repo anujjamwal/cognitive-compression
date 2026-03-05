@@ -2,13 +2,12 @@ from typing import Any, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
-from transformers import AutoProcessor, Cache, LogitsProcessorList, PreTrainedModel, ProcessorMixin, StoppingCriteriaList
+from transformers import  Cache, LogitsProcessorList, StoppingCriteriaList
 from transformers.generation.utils import GenerationMixin, ALL_CACHE_NAMES, GenerateEncoderDecoderOutput, GenerateDecoderOnlyOutput
 from transformers.generation.configuration_utils import GenerationConfig
 from transformers.generation.streamers import BaseStreamer
 from transformers.utils.generic import ModelOutput
 from transformers import PreTrainedTokenizerBase
-from trl.trainer.utils import get_config_model_id
 
 
 def _prepare_inputs_for_generation(
