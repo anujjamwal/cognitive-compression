@@ -59,7 +59,7 @@ AVAILABLE_MODES = {
     "hcot-cached": GenerationMode(name="HCoT Prune (Cached)", generate_fn=_sample, kwargs={"use_cache": True}),
 }
 
-VALID_LEVELS = ["top", "high", "medium", "low"]
+VALID_LEVELS = ["top", "high", "middle", "low"]
 
 
 def parse_args():

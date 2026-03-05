@@ -97,8 +97,9 @@ def load_math(
     return problems
 
 
-# Polymath difficulty level ordering (top = easiest, low = hardest)
-POLYMATH_LEVELS = ("top", "high", "medium", "low")
+# Polymath difficulty level ordering (top = easiest, low = hardest).
+# The official PolyMath dataset uses "middle" (not "medium").
+POLYMATH_LEVELS = ("top", "high", "middle", "low")
 
 
 def load_polymath(
@@ -121,7 +122,7 @@ def load_polymath(
         HuggingFace dataset identifier.  Override if using a mirror.
     levels:
         Optional filter — keep only these difficulty levels.
-        Valid values: ``"top"`` (easiest), ``"high"``, ``"medium"``,
+        Valid values: ``"top"`` (easiest), ``"high"``, ``"middle"``,
         ``"low"`` (hardest).
     """
     ds = load_dataset(dataset_id, language)
