@@ -195,3 +195,55 @@ class TestFallbackComputeLoss:
 
         assert loss.dim() == 0
         assert loss.requires_grad
+
+    def test_mask_shape_matches_model_dtype(self):
+        """The 4D mask dtype must match the model parameter dtype."""
+        model = _tiny_model().to(torch.float32)
+        trainer = _make_trainer(prune_aware=False)
+        trainer.model = model
+
+        ids = torch.tensor([[10, 11, THOUGHT_ID, 12, 13, SOLUTION_ID, 14, RETURN_ID, 15, 16]])
+        mask = torch.ones_like(ids)
+        inputs = {'input_ids': ids, 'attention_mask': mask, 'labels': ids.clone()}
+
+        attn_mask = trainer._prepare_attention_mask(inputs)
+        assert attn_mask.dtype == torch.float32
+
+    def test_hierarchical_mask_affects_logits(self):
+        """Verify the 4D mask actually changes model output.
+
+        When the hierarchical mask blocks thought content after [RETURN],
+        logits at post-[RETURN] positions must differ from a plain causal
+        run.  If they are identical, the mask is being silently ignored
+        (e.g. by Flash Attention or SDPA with is_causal=True).
+        """
+        model = _tiny_model().to(torch.bfloat16)
+        trainer = _make_trainer(prune_aware=False)
+        trainer.model = model
+
+        # A B [TH] c d [SOL] e [RET] f g
+        ids = torch.tensor([[10, 11, THOUGHT_ID, 12, 13, SOLUTION_ID, 14, RETURN_ID, 15, 16]])
+        mask_2d = torch.ones_like(ids)
+
+        # Run with standard causal mask (no hierarchical masking)
+        with torch.no_grad():
+            out_causal = model(input_ids=ids, attention_mask=mask_2d)
+
+        # Run with hierarchical mask
+        inputs = {'input_ids': ids, 'attention_mask': mask_2d.clone(), 'labels': ids.clone()}
+        attn_4d = trainer._prepare_attention_mask(inputs)
+        with torch.no_grad():
+            out_masked = model(input_ids=ids, attention_mask=attn_4d)
+
+        # Logits AFTER [RETURN] must differ — the mask blocks thought content
+        # that was visible under the plain causal mask.
+        return_pos = 7  # [RETURN] is at index 7
+        post_return_causal = out_causal.logits[:, return_pos + 1:, :]
+        post_return_masked = out_masked.logits[:, return_pos + 1:, :]
+        assert not torch.allclose(
+            post_return_causal, post_return_masked, atol=1e-4
+        ), (
+            "Logits after [RETURN] are identical with and without the "
+            "hierarchical mask — the 4D mask is being silently ignored! "
+            "Ensure the model uses attn_implementation='eager' or 'sdpa'."
+        )
