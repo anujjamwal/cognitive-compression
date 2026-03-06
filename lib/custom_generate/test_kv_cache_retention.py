@@ -382,6 +382,93 @@ class TestRetainAndPruneKvCache:
 
 
 # ---------------------------------------------------------------------------
+# _retain_and_prune_kv_cache — reprefill mode
+# ---------------------------------------------------------------------------
+
+class TestRetainAndPruneKvCacheReprefill:
+    def test_reprefill_keeps_only_prefix(self):
+        """Reprefill mode should keep only [0..thought_pos] in the cache."""
+        seq_len = 20
+        cache = _make_cache(BATCH_SIZE, NUM_LAYERS, NUM_HEADS, seq_len, HEAD_DIM)
+        thought_pos, solution_pos = 5, 10
+        prune_map = {0: (thought_pos, solution_pos)}
+
+        new_seq = _retain_and_prune_kv_cache(
+            cache, prune_map, BATCH_SIZE, seq_len, HEAD_DIM, ROPE_THETA,
+            prune_aware=True, reprefill=True,
+        )
+
+        # Only prefix [0..5] = 6 entries
+        assert new_seq == thought_pos + 1
+        assert _cache_keys(cache, 0).shape == (BATCH_SIZE, NUM_HEADS, 6, HEAD_DIM)
+        assert _cache_values(cache, 0).shape == (BATCH_SIZE, NUM_HEADS, 6, HEAD_DIM)
+
+    def test_reprefill_prefix_values_unchanged(self):
+        """Prefix keys and values should be preserved exactly."""
+        seq_len = 20
+        cache = _make_cache(BATCH_SIZE, NUM_LAYERS, NUM_HEADS, seq_len, HEAD_DIM)
+        thought_pos, solution_pos = 5, 10
+        prune_map = {0: (thought_pos, solution_pos)}
+
+        orig_k = _cache_keys(cache, 0)[:, :, :thought_pos + 1, :].clone()
+        orig_v = _cache_values(cache, 0)[:, :, :thought_pos + 1, :].clone()
+
+        _retain_and_prune_kv_cache(
+            cache, prune_map, BATCH_SIZE, seq_len, HEAD_DIM, ROPE_THETA,
+            prune_aware=True, reprefill=True,
+        )
+
+        assert torch.allclose(_cache_keys(cache, 0)[:, :, :thought_pos + 1, :], orig_k)
+        assert torch.allclose(_cache_values(cache, 0)[:, :, :thought_pos + 1, :], orig_v)
+
+    def test_reprefill_no_rope_correction(self):
+        """Reprefill should not apply any RoPE correction (keys identical to original prefix)."""
+        seq_len = 20
+        cache = _make_cache(BATCH_SIZE, NUM_LAYERS, NUM_HEADS, seq_len, HEAD_DIM)
+        thought_pos, solution_pos = 5, 10
+        prune_map = {0: (thought_pos, solution_pos)}
+
+        orig_all_k = _cache_keys(cache, 0).clone()
+
+        _retain_and_prune_kv_cache(
+            cache, prune_map, BATCH_SIZE, seq_len, HEAD_DIM, ROPE_THETA,
+            prune_aware=True, reprefill=True,
+        )
+
+        # All kept keys should match the original prefix exactly
+        new_k = _cache_keys(cache, 0)[:, :, :thought_pos + 1, :]
+        assert torch.allclose(new_k, orig_all_k[:, :, :thought_pos + 1, :])
+
+    def test_reprefill_non_pruned_keeps_all(self):
+        """Non-pruned batch elements should keep all entries in reprefill mode."""
+        seq_len = 20
+        cache = _make_cache(BATCH_SIZE, NUM_LAYERS, NUM_HEADS, seq_len, HEAD_DIM)
+        prune_map: dict[int, tuple[int, int]] = {}  # no pruning
+
+        orig_k = _cache_keys(cache, 0).clone()
+
+        new_seq = _retain_and_prune_kv_cache(
+            cache, prune_map, BATCH_SIZE, seq_len, HEAD_DIM, ROPE_THETA,
+            prune_aware=True, reprefill=True,
+        )
+
+        # All entries should be kept (unlike surgery mode which drops the last)
+        assert new_seq == seq_len
+        assert torch.allclose(_cache_keys(cache, 0), orig_k)
+
+    def test_reprefill_empty_cache(self):
+        """Empty cache in reprefill mode should not crash."""
+        cache = DynamicCache()
+        prune_map = {0: (5, 10)}
+
+        new_seq = _retain_and_prune_kv_cache(
+            cache, prune_map, BATCH_SIZE, 0, HEAD_DIM, ROPE_THETA,
+            prune_aware=True, reprefill=True,
+        )
+        assert new_seq == 0
+
+
+# ---------------------------------------------------------------------------
 # _prune_model_inputs with retain_kv_cache
 # ---------------------------------------------------------------------------
 
@@ -460,6 +547,71 @@ class TestPruneModelInputsWithCacheRetention:
         # cache_position should be full range (for prefill)
         pruned_len = seq_len - (solution_pos - thought_pos)
         assert new_kwargs['cache_position'].tolist() == list(range(pruned_len))
+
+    def test_cache_reprefill_mode(self):
+        """With retain_kv_cache="reprefill", cache should keep only the prefix."""
+        model = _make_mock_model()
+        seq_len = 20
+
+        input_ids = torch.arange(seq_len).unsqueeze(0).long()
+        thought_pos, solution_pos, return_pos = 5, 10, 19
+
+        cache = _make_cache(1, NUM_LAYERS, NUM_HEADS, seq_len, HEAD_DIM)
+        model_kwargs = {
+            'past_key_values': cache,
+            'attention_mask': torch.ones(1, seq_len, dtype=torch.long),
+            'cache_position': torch.tensor([seq_len - 1], dtype=torch.int64),
+        }
+
+        new_input_ids, new_kwargs = _prune_model_inputs(
+            model,
+            prune_input_candidates=[0],
+            prune_input_locations=[[(thought_pos, solution_pos, return_pos)]],
+            input_ids=input_ids,
+            prune_aware=True,
+            model_kwargs=model_kwargs,
+            retain_kv_cache="reprefill",
+        )
+
+        # Cache should still be present
+        assert 'past_key_values' in new_kwargs
+        retained_cache = new_kwargs['past_key_values']
+        assert isinstance(retained_cache, DynamicCache)
+
+        # Cache should have only the prefix (thought_pos + 1 entries)
+        assert _cache_keys(retained_cache, 0).shape[2] == thought_pos + 1
+
+        # input_ids should be pruned (same as other modes)
+        pruned_len = seq_len - (solution_pos - thought_pos)  # 15
+        assert new_input_ids.shape[1] == pruned_len
+
+        # cache_position should cover solution tokens for re-processing
+        expected_cache_pos = list(range(thought_pos + 1, pruned_len))
+        assert new_kwargs['cache_position'].tolist() == expected_cache_pos
+
+    def test_reprefill_input_ids_match_other_modes(self):
+        """Pruned input_ids should be the same across all cache strategies."""
+        model = _make_mock_model()
+        seq_len = 20
+        input_ids = torch.arange(seq_len).unsqueeze(0).long()
+        thought_pos, solution_pos, return_pos = 5, 10, 19
+
+        results = {}
+        for strategy in [True, False, "reprefill"]:
+            cache = _make_cache(1, NUM_LAYERS, NUM_HEADS, seq_len, HEAD_DIM)
+            kwargs = {
+                'past_key_values': cache,
+                'attention_mask': torch.ones(1, seq_len, dtype=torch.long),
+                'cache_position': torch.tensor([seq_len - 1], dtype=torch.int64),
+            }
+            ids, _ = _prune_model_inputs(
+                model, [0], [[(thought_pos, solution_pos, return_pos)]],
+                input_ids.clone(), True, kwargs, retain_kv_cache=strategy,
+            )
+            results[str(strategy)] = ids
+
+        assert torch.equal(results["True"], results["False"])
+        assert torch.equal(results["True"], results["reprefill"])
 
     def test_input_ids_unchanged(self):
         """The pruned input_ids should be the same regardless of cache retention mode."""
