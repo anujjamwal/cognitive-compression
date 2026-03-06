@@ -11,70 +11,6 @@ from transformers import PreTrainedTokenizerBase
 
 
 # ---------------------------------------------------------------------------
-# RoPE correction helpers for KV-cache retention after pruning
-# ---------------------------------------------------------------------------
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Swap and negate halves — same convention as HuggingFace RoPE."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _build_rope_correction(
-    shift: int,
-    head_dim: int,
-    rope_theta: float,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute cos/sin tensors for RoPE position-shift correction.
-
-    When cached keys need their RoPE positions decreased by *shift* (i.e. they
-    move from position p to p − shift), we apply a rotation of angle −shift·θᵢ
-    to each dimension pair i.
-
-    In the HF ``apply_rotary_pos_emb`` convention
-        k_new = k · cos_corr + rotate_half(k) · sin_corr
-    this translates to:
-        cos_corr = cos(shift · θ)   (cos is even, so cos(−α) = cos(α))
-        sin_corr = −sin(shift · θ)  (sin is odd,  so sin(−α) = −sin(α))
-
-    Returns ``(cos_corr, sin_corr)`` each of shape ``(head_dim,)``.
-    """
-    half_dim = head_dim // 2
-    inv_freq = 1.0 / (
-        rope_theta
-        ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
-    )
-    angles = shift * inv_freq                        # (half_dim,)
-    cos_vals = torch.cos(angles).to(dtype)
-    sin_vals = -torch.sin(angles).to(dtype)          # negative for backward shift
-    # Duplicate to full head_dim (matching HF's ``emb = cat(freqs, freqs)``)
-    cos_corr = torch.cat([cos_vals, cos_vals])       # (head_dim,)
-    sin_corr = torch.cat([sin_vals, sin_vals])       # (head_dim,)
-    return cos_corr, sin_corr
-
-
-def _apply_rope_correction(
-    keys: torch.Tensor,
-    cos_corr: torch.Tensor,
-    sin_corr: torch.Tensor,
-) -> torch.Tensor:
-    """Apply RoPE position correction to cached keys.
-
-    Uses the same rotation convention as HuggingFace:
-        k_corrected = k · cos + rotate_half(k) · sin
-
-    Args:
-        keys:     shape ``(..., seq, head_dim)``
-        cos_corr: shape ``(head_dim,)``
-        sin_corr: shape ``(head_dim,)``  (already negated for backward shift)
-    """
-    return keys * cos_corr + _rotate_half(keys) * sin_corr
-
-
-# ---------------------------------------------------------------------------
 # KV-cache manipulation
 # ---------------------------------------------------------------------------
 
@@ -83,32 +19,15 @@ def _retain_and_prune_kv_cache(
     prune_map: dict[int, Tuple[int, int]],
     batch_size: int,
     old_seq_len: int,
-    head_dim: int,
-    rope_theta: float,
-    prune_aware: bool,
-    reprefill: bool = False,
 ) -> int:
     """Modify a DynamicCache in-place after a pruning event.
 
-    Supports two retention strategies:
+    For each pruned batch element the function keeps only the prefix
+    ``[0..thought_pos]`` in the cache.  Both thought and solution tokens are
+    removed.  The caller sets ``cache_position`` so the next forward pass
+    re-processes the solution tokens against the cached prefix.
 
-    **Surgery mode** (``reprefill=False``, default):
-      1. Removes KV entries for the pruned token range
-         ``(thought_pos, solution_pos]``.
-      2. *(prune-aware only)* Applies a RoPE correction rotation to keys
-         whose positions shifted left.
-      3. Removes the **last** KV entry so that the generation loop naturally
-         re-processes the final token on the next iteration (needed to
-         produce fresh logits that reflect the pruned context).
-      For non-pruned batch elements the last entry is also removed so the
-      entire batch can proceed uniformly through a single-token forward pass.
-
-    **Reprefill mode** (``reprefill=True``):
-      Keeps only the prefix ``[0..thought_pos]`` in the cache.  Both the
-      thought tokens *and* the solution tokens are removed.  The caller is
-      expected to set ``cache_position`` so that the next forward pass
-      re-processes the solution tokens against the cached prefix.  This
-      avoids RoPE surgery entirely while being cheaper than a full discard.
+    For non-pruned batch elements all entries are kept.
 
     Compatible with both transformers ≥5.x (``cache.layers[i].keys/values``)
     and older versions (``cache.key_cache[i]``).
@@ -135,53 +54,21 @@ def _retain_and_prune_kv_cache(
         return 0
     device = first_keys.device
     dtype = first_keys.dtype
+    head_dim = first_keys.shape[-1]
 
-    # Pre-compute per-element keep indices and RoPE corrections
+    # Pre-compute per-element keep indices
     keep_indices: list[torch.Tensor] = []
-    rope_corrections: list[Tuple[torch.Tensor, torch.Tensor] | None] = []
-    # Index in the *kept* tensor where the "after block" keys start
-    split_points: list[int] = []
 
     for b in range(batch_size):
         if b in prune_map:
-            thought_pos, solution_pos = prune_map[b]
-            shift = solution_pos - thought_pos  # number of positions removed
-
-            if reprefill:
-                # Reprefill mode: keep only prefix [0..thought_pos].
-                # Solution tokens will be re-processed by the next forward pass.
-                keep = torch.arange(0, thought_pos + 1, device=device)
-                keep_indices.append(keep)
-                split_points.append(thought_pos + 1)
-                rope_corrections.append(None)  # no RoPE surgery needed
-            else:
-                # Surgery mode: keep [0..thought_pos] ∪ [solution_pos+1..old_seq_len-2]
-                # (exclude old_seq_len-1 = the last entry, to force re-processing)
-                before = torch.arange(0, thought_pos + 1, device=device)
-                after = torch.arange(solution_pos + 1, old_seq_len - 1, device=device)
-                keep = torch.cat([before, after])
-                keep_indices.append(keep)
-
-                split_at = thought_pos + 1  # where "after" entries start in kept
-                split_points.append(split_at)
-
-                if prune_aware and shift > 0:
-                    cos_corr, sin_corr = _build_rope_correction(
-                        shift, head_dim, rope_theta, device, dtype
-                    )
-                    rope_corrections.append((cos_corr, sin_corr))
-                else:
-                    rope_corrections.append(None)
+            thought_pos, _solution_pos = prune_map[b]
+            # Keep only prefix [0..thought_pos].
+            # Solution tokens will be re-processed by the next forward pass.
+            keep = torch.arange(0, thought_pos + 1, device=device)
         else:
-            if reprefill:
-                # Non-pruned: keep all entries (no last-entry removal needed)
-                keep = torch.arange(0, old_seq_len, device=device)
-            else:
-                # Non-pruned: keep all except the last entry
-                keep = torch.arange(0, old_seq_len - 1, device=device)
-            keep_indices.append(keep)
-            split_points.append(old_seq_len)  # no split needed
-            rope_corrections.append(None)
+            # Non-pruned: keep all entries
+            keep = torch.arange(0, old_seq_len, device=device)
+        keep_indices.append(keep)
 
     max_new_seq = max(k.shape[0] for k in keep_indices)
 
@@ -204,14 +91,6 @@ def _retain_and_prune_kv_cache(
             keep = keep_indices[b]
             kept_k = old_keys[b, :, keep, :]   # (heads, kept_len, dim)
             kept_v = old_vals[b, :, keep, :]
-
-            # Apply RoPE correction to shifted keys
-            corr = rope_corrections[b]
-            if corr is not None:
-                sp = split_points[b]
-                kept_k[:, sp:, :] = _apply_rope_correction(
-                    kept_k[:, sp:, :], corr[0], corr[1]
-                )
 
             n = keep.shape[0]
             new_keys[b, :, :n, :] = kept_k
@@ -290,32 +169,19 @@ def _prune_model_inputs(
     input_ids: torch.LongTensor,
     prune_aware: bool,
     model_kwargs: dict[str, Any],
-    retain_kv_cache: bool | str = True,
+    retain_kv_cache: bool = True,
 ) -> Tuple[torch.LongTensor, dict[str, Any]]:
     """Prune input sequences after a ``[RETURN]`` token is generated.
 
-    ``retain_kv_cache`` controls post-prune KV cache handling:
+    When ``retain_kv_cache=True`` (default), the function retains the
+    prefix (tokens before the thought block) in the KV cache and sets
+    ``cache_position`` so the next forward pass re-processes the solution
+    tokens against the cached prefix.  Cost: O(k) where k = number of
+    solution tokens.
 
-    - ``True`` or ``"surgery"`` — retain the cache, apply RoPE correction to
-      shifted keys.  Cost: O(1) single-token forward pass.
-    - ``"reprefill"`` — retain only the prefix (tokens before the thought
-      block) in the cache, discard thought *and* solution entries, and let
-      the next forward pass re-process the solution tokens.  No RoPE
-      surgery needed.  Cost: O(k) where k = number of solution tokens.
-    - ``False`` or ``"discard"`` — discard the entire cache and re-prefill
-      from scratch.  Cost: O(N).
-
-    Falls back to discard when the cache object is not a DynamicCache or is
-    empty.
+    When ``retain_kv_cache=False``, the entire cache is discarded and a
+    full re-prefill is performed.  Cost: O(N).
     """
-    # Normalize retain_kv_cache to a strategy string
-    if isinstance(retain_kv_cache, bool):
-        cache_strategy = "surgery" if retain_kv_cache else "discard"
-    elif isinstance(retain_kv_cache, str):
-        cache_strategy = retain_kv_cache
-    else:
-        cache_strategy = "discard"
-
     is_prune_agnostic = not prune_aware
 
     batch_size = input_ids.shape[0]
@@ -355,7 +221,7 @@ def _prune_model_inputs(
         hasattr(cache, 'key_cache') and len(cache.key_cache) > 0  # type: ignore[union-attr]
     ) if cache is not None else False
     can_retain_cache = (
-        cache_strategy in ("surgery", "reprefill")
+        retain_kv_cache
         and cache is not None
         and isinstance(cache, DynamicCache)
         and cache_populated
@@ -409,36 +275,20 @@ def _prune_model_inputs(
             old_seq_len = cache.layers[0].keys.shape[2]
         else:
             old_seq_len = cache.key_cache[0].shape[2]  # type: ignore[union-attr]
-        head_dim = model.config.hidden_size // model.config.num_attention_heads
-        rope_theta = getattr(model.config, 'rope_theta', 10000.0)
-
-        is_reprefill = cache_strategy == "reprefill"
 
         new_cache_seq = _retain_and_prune_kv_cache(
             cache=cache,  # type: ignore[arg-type]
             prune_map=prune_map,
             batch_size=batch_size,
             old_seq_len=old_seq_len,
-            head_dim=head_dim,
-            rope_theta=rope_theta,
-            prune_aware=prune_aware,
-            reprefill=is_reprefill,
         )
 
-        if is_reprefill:
-            # Cache has only the prefix (a tokens).  Set cache_position so
-            # the next forward pass re-processes the solution tokens (c tokens)
-            # against the cached prefix.  Cost: O(k) where k = solution length.
-            model_kwargs['cache_position'] = torch.arange(
-                new_cache_seq, max_len, dtype=torch.int64, device=device,
-            )
-        else:
-            # Surgery mode: cache has all surviving entries minus the last.
-            # Set cache_position so the next forward pass processes just
-            # the last token of the pruned sequence (single-token decode).
-            model_kwargs['cache_position'] = torch.tensor(
-                [max_len - 1], dtype=torch.int64, device=device,
-            )
+        # Cache has only the prefix (a tokens).  Set cache_position so
+        # the next forward pass re-processes the solution tokens (c tokens)
+        # against the cached prefix.  Cost: O(k) where k = solution length.
+        model_kwargs['cache_position'] = torch.arange(
+            new_cache_seq, max_len, dtype=torch.int64, device=device,
+        )
     else:
         # Fallback: discard the KV cache and re-prefill from scratch
         old_cache = model_kwargs.pop('past_key_values', None)
@@ -465,7 +315,7 @@ def _sample(
     synced_gpus: bool = False,
     streamer: Optional["BaseStreamer"] = None,
     prune_aware: bool = False,
-    retain_kv_cache: bool | str = True,
+    retain_kv_cache: bool = True,
     **model_kwargs,
 ):
     """Generate sequences using argmax or sampling from model logits.
@@ -482,20 +332,16 @@ def _sample(
         synced_gpus (bool): Whether GPUs are synchronized for multi-device generation. Defaults to False.
         streamer (Optional[BaseStreamer]): Optional streamer to output tokens during generation. Defaults to None.
         prune_aware (bool): When True, positions are renumbered after pruning (contiguous). Defaults to False.
-        retain_kv_cache (bool | str): Controls post-prune KV cache handling.
-            - ``True`` or ``"surgery"``: retain cache with RoPE correction. O(1) cost.
-            - ``"reprefill"``: retain prefix only, re-process solution tokens. O(k) cost.
-            - ``False`` or ``"discard"``: discard cache entirely. O(N) cost.
-            Defaults to True.
+        retain_kv_cache (bool): When True (default), retains the prefix in the KV cache
+            after pruning and re-processes only the solution tokens.  Cost: O(k).
+            When False, discards the cache entirely and re-prefills.  Cost: O(N).
         **model_kwargs: Additional keyword arguments passed to the model forward pass.
     Returns:
         torch.LongTensor: Generated sequences of shape (batch_size, seq_len) including input and generated tokens.
     Notes:
-        - In prune-aware mode with retain_kv_cache=True, after pruning the KV cache is retained
-          with RoPE-corrected keys for shifted positions. Only the last token is re-processed.
-        - With retain_kv_cache="reprefill", the prefix is cached and solution tokens are
-          re-processed via a standard forward pass — no RoPE surgery needed.
-        - In prune-aware mode with retain_kv_cache=False, the KV cache is discarded and the full
+        - With retain_kv_cache=True, the prefix is cached and solution tokens are
+          re-processed via a standard forward pass.
+        - With retain_kv_cache=False, the KV cache is discarded and the full
           pruned sequence is re-prefilled from scratch.
         - In prune-agnostic mode, position_ids are tracked explicitly to maintain original RoPE
           positions for surviving tokens.
@@ -648,16 +494,15 @@ def _sample(
         return input_ids
 
 
-def generate(model, processing_class = None, retain_kv_cache: bool | str = True, **kwargs):
+def generate(model, processing_class = None, retain_kv_cache: bool = True, **kwargs):
     """Custom generate method for Hierarchical Chain of Thought.
 
     Args:
         model: The language model.
         processing_class: Tokenizer / processing class.
-        retain_kv_cache: Controls post-prune KV cache handling.
-            - ``True`` or ``"surgery"``: retain cache with RoPE correction. O(1).
-            - ``"reprefill"``: retain prefix, re-process solution tokens. O(k).
-            - ``False`` or ``"discard"``: discard cache entirely. O(N).
+        retain_kv_cache: When True (default), retains the prefix in the KV
+            cache after pruning and re-processes solution tokens.  When False,
+            discards the cache entirely.
         **kwargs: Forwarded to ``model.generate``.
     """
 
