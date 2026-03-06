@@ -52,8 +52,8 @@ logger = logging.getLogger(__name__)
 
 AVAILABLE_MODES = {
     "baseline": GenerationMode(name="Baseline", generate_fn=None, kwargs={"use_cache": True}),
-    "hcot": GenerationMode(name="HCoT Prune", generate_fn=_sample, kwargs={"use_cache": False}),
-    "hcot-cached": GenerationMode(name="HCoT Prune (Cached)", generate_fn=_sample, kwargs={"use_cache": True}),
+    "hcot": GenerationMode(name="HCoT Prune", generate_fn=_sample, kwargs={"use_cache": True, "prune_aware": True}),
+    "hcot-agnostic": GenerationMode(name="HCoT Prune-Agnostic", generate_fn=_sample, kwargs={"use_cache": True, "prune_aware": False}),
 }
 
 
