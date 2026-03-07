@@ -61,8 +61,15 @@ def build_stages(input_ids_b, labels_b, attention_mask_b, blocks, label_mask=-10
             for i in range(tp + 1, sp + 1):
                 remove_positions.add(i)
 
-        # Keep non-removed, non-padding positions
-        kept = [p for p in range(seq_len)
+        # Truncate: only include positions up to the current RETURN (inclusive),
+        # or to the end of the sequence for the final stage
+        if stage_idx < n_blocks:
+            upper = sorted_blocks[stage_idx][2] + 1  # inclusive of current RETURN
+        else:
+            upper = seq_len
+
+        # Keep non-removed, non-padding positions up to the truncation point
+        kept = [p for p in range(upper)
                 if p not in remove_positions and attention_mask_b[p]]
 
         if not kept:

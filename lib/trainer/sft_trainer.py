@@ -1,4 +1,5 @@
 from dataclasses import field
+import logging
 from typing import Any
 import torch
 from torch import nn
@@ -7,6 +8,14 @@ from transformers.processing_utils import ProcessorMixin
 from trl import trainer
 from trl.trainer.utils import get_config_model_id
 import utils
+
+logger = logging.getLogger(__name__)
+
+# Attention implementations that are known to correctly handle custom 4D
+# attention masks.  Flash-Attention-2 only supports 2D (padding) masks and
+# will silently ignore a full 4D mask, which completely breaks the
+# hierarchical masking required by prune_aware=False training.
+_4D_MASK_SAFE_ATTN_IMPLEMENTATIONS = {"eager", "sdpa"}
 
 
 class HCotSFTTrainer(trainer.sft_trainer.SFTTrainer):
@@ -30,13 +39,60 @@ class HCotSFTTrainer(trainer.sft_trainer.SFTTrainer):
         self.return_token_id = tokenizer.convert_tokens_to_ids("[RETURN]")
         self.prune_aware = prune_aware
 
+        if not prune_aware:
+            self._validate_attn_implementation(model)
+
         super().__init__(model, args=args, processing_class=processing_class, **kwargs)
 
+    @staticmethod
+    def _validate_attn_implementation(model: PreTrainedModel):
+        """Ensure the model uses an attention implementation that respects 4D masks.
 
-    def _prepare_attention_mask(self, inputs: dict[str, torch.Tensor|Any]):
+        prune_aware=False relies on a custom 4D hierarchical attention mask to
+        simulate pruning during training.  Flash-Attention-2 only supports 2D
+        padding masks and will silently drop the hierarchical pattern, making
+        training equivalent to plain SFT.  This causes the model to never
+        learn post-pruning continuations, producing out-of-order / invalid
+        special-token sequences at inference time.
+        """
+        attn_impl = getattr(model.config, "_attn_implementation", None)
+        if attn_impl and attn_impl not in _4D_MASK_SAFE_ATTN_IMPLEMENTATIONS:
+            raise ValueError(
+                f"prune_aware=False requires an attention implementation that "
+                f"respects custom 4D masks. The model uses "
+                f"'{attn_impl}' which is not supported. "
+                f"Load the model with "
+                f'attn_implementation="eager" or "sdpa" instead. '
+                f"Supported: {sorted(_4D_MASK_SAFE_ATTN_IMPLEMENTATIONS)}"
+            )
+        if attn_impl:
+            logger.info(
+                "prune_aware=False: attention implementation '%s' is compatible "
+                "with 4D hierarchical masks.",
+                attn_impl,
+            )
+        else:
+            logger.warning(
+                "Could not determine the model's attention implementation. "
+                "prune_aware=False requires 'eager' or 'sdpa' to correctly "
+                "apply the 4D hierarchical mask. If using flash_attention_2, "
+                "the mask will be silently ignored and training will degrade "
+                "to plain SFT."
+            )
+
+
+    def _prepare_attention_mask(self, inputs: dict[str, torch.Tensor|Any], dtype: torch.dtype | None = None):
         input_ids = inputs['input_ids']
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
+
+        # Use the model's parameter dtype so the mask matches activations.
+        # Falls back to bfloat16 when the dtype cannot be determined.
+        if dtype is None:
+            try:
+                dtype = next(self.model.parameters()).dtype
+            except (StopIteration, AttributeError):
+                dtype = torch.bfloat16
 
         batch_blocks = utils.find_cot_blocks(
             input_ids, self.thought_token_id, self.solution_token_id, self.return_token_id
@@ -60,9 +116,9 @@ class HCotSFTTrainer(trainer.sft_trainer.SFTTrainer):
 
         mask_tensor = torch.stack(masks).unsqueeze(1)
         float_mask = torch.zeros(
-            batch_size, 1, seq_len, seq_len, dtype=torch.bfloat16, device=device
+            batch_size, 1, seq_len, seq_len, dtype=dtype, device=device
         )
-        float_mask.masked_fill_(~mask_tensor, torch.finfo(torch.bfloat16).min)
+        float_mask.masked_fill_(~mask_tensor, torch.finfo(dtype).min)
         return float_mask
 
     def _compute_loss_staged(
