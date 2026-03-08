@@ -57,36 +57,30 @@ def _retain_and_prune_kv_cache(
     dtype = first_keys.dtype
     head_dim = first_keys.shape[-1]
 
-    # Pre-compute per-element keep indices
-    keep_indices: list[torch.Tensor] = []
-
+    # Compute per-element prefix length as plain ints (no GPU tensors needed).
+    # The kept positions are always contiguous [0..N) by construction, so we
+    # only need the length, not explicit index tensors.
+    prefix_lengths: list[int] = []
     for b in range(batch_size):
         if b in prune_map:
             thought_pos, _solution_pos = prune_map[b]
-            # Keep only prefix [0..thought_pos].
-            # Solution tokens will be re-processed by the next forward pass.
-            keep = torch.arange(0, thought_pos + 1, device=device)
+            prefix_lengths.append(thought_pos + 1)
         else:
-            # Non-pruned: keep all entries
-            keep = torch.arange(0, old_seq_len, device=device)
-        keep_indices.append(keep)
+            prefix_lengths.append(old_seq_len)
 
-    max_new_seq = max(k.shape[0] for k in keep_indices)
+    max_new_seq = max(prefix_lengths)
 
-    # Fast path: check if all batch elements keep the same contiguous prefix.
-    # This is the common case (batch_size=1, or all pruned to same point).
-    all_same_prefix = len(set(k.shape[0] for k in keep_indices)) == 1
-    is_contiguous_prefix = all_same_prefix and all(
-        torch.equal(k, torch.arange(k.shape[0], device=device)) for k in keep_indices
-    )
+    # Fast path: all batch elements keep the same contiguous prefix length.
+    # Common case (batch_size=1, or all pruned to the same point).
+    all_same_prefix = len(set(prefix_lengths)) == 1
 
     # Pre-compute gather indices once (used across all layers) for the
-    # heterogeneous fallback path.
-    if not is_contiguous_prefix:
+    # heterogeneous fallback path only.
+    if not all_same_prefix:
         idx = torch.zeros(batch_size, max_new_seq, dtype=torch.long, device=device)
         for b in range(batch_size):
-            n = keep_indices[b].shape[0]
-            idx[b, :n] = keep_indices[b]
+            n = prefix_lengths[b]
+            idx[b, :n] = torch.arange(n, device=device)
 
     for layer_idx in range(num_layers):
         if use_layers_api:
@@ -96,11 +90,10 @@ def _retain_and_prune_kv_cache(
             old_keys = cache.key_cache[layer_idx]      # type: ignore[attr-defined]
             old_vals = cache.value_cache[layer_idx]     # type: ignore[attr-defined]
 
-        if is_contiguous_prefix:
+        if all_same_prefix:
             # Single slice — no allocation, just a contiguous copy
-            prefix_len = keep_indices[0].shape[0]
-            new_keys = old_keys[:, :, :prefix_len, :].contiguous()
-            new_vals = old_vals[:, :, :prefix_len, :].contiguous()
+            new_keys = old_keys[:, :, :prefix_lengths[0], :].contiguous()
+            new_vals = old_vals[:, :, :prefix_lengths[0], :].contiguous()
         else:
             # Vectorized gather across batch and heads
             num_heads = old_keys.shape[1]
@@ -165,6 +158,7 @@ def _update_model_kwargs_for_generation(
     model_kwargs: dict[str, Any],
     is_encoder_decoder: bool = False,
     num_new_tokens: int = 1,
+    use_pos_ids_buf: bool = False,
 ) -> dict[str, Any]:
     model_kwargs = GenerationMixin._update_model_kwargs_for_generation(
         model,
@@ -188,12 +182,12 @@ def _update_model_kwargs_for_generation(
     # HF's _update_model_kwargs_for_generation does not manage position_ids.
     # For prune-agnostic mode we track position_ids explicitly after each
     # prune event so that RoPE positions match training.
-    # When _pos_ids_buf is set (buffer mode from _sample), skip the O(n)
-    # concatenation here — _sample writes directly into the buffer.
+    # When use_pos_ids_buf=True, _sample manages position_ids via a
+    # pre-allocated buffer, so skip the O(n) concatenation here.
     if (
         "position_ids" in model_kwargs
         and model_kwargs["position_ids"] is not None
-        and "_pos_ids_buf" not in model_kwargs
+        and not use_pos_ids_buf
     ):
         pos = model_kwargs["position_ids"]
         model_kwargs["position_ids"] = torch.cat([pos, pos[:, -1:] + 1], dim=-1)
@@ -253,12 +247,14 @@ def _prune_model_inputs(
     # ------------------------------------------------------------------
     cache = model_kwargs.get('past_key_values', None)
     use_layers_api = hasattr(cache, 'layers')
-    cache_populated = (
-        (use_layers_api and len(cache.layers) > 0) if cache is not None
-        else False
-    ) or (
-        hasattr(cache, 'key_cache') and len(cache.key_cache) > 0  # type: ignore[union-attr]
-    ) if cache is not None else False
+    if cache is None:
+        cache_populated = False
+    elif use_layers_api:
+        cache_populated = len(cache.layers) > 0
+    elif hasattr(cache, 'key_cache'):
+        cache_populated = len(cache.key_cache) > 0  # type: ignore[union-attr]
+    else:
+        cache_populated = False
     can_retain_cache = (
         retain_kv_cache
         and cache is not None
@@ -284,27 +280,38 @@ def _prune_model_inputs(
         else:
             new_rows.append(input_ids[b])
 
-    # Pad to uniform length
-    max_len = max(r.shape[0] for r in new_rows)
-    pad_id = getattr(model.config, 'pad_token_id', None)
-    if pad_id is None:
-        pad_id = getattr(model.config, 'eos_token_id', 0)
-
-    new_input_ids = torch.full((batch_size, max_len), pad_id, dtype=input_ids.dtype, device=device)
-    new_attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
-    for b, r in enumerate(new_rows):
-        new_input_ids[b, :r.shape[0]] = r
-        new_attention_mask[b, :r.shape[0]] = 1
-
-    if is_prune_agnostic:
-        new_position_ids = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
-        for b, p in enumerate(new_position_rows):
-            new_position_ids[b, :p.shape[0]] = p
-        model_kwargs['position_ids'] = new_position_ids
+    # Build pruned input_ids, attention_mask, and position_ids
+    if batch_size == 1:
+        # Fast path: no inter-batch padding needed
+        new_input_ids = new_rows[0].unsqueeze(0)
+        max_len = new_input_ids.shape[1]
+        model_kwargs['attention_mask'] = torch.ones(1, max_len, dtype=torch.long, device=device)
+        if is_prune_agnostic:
+            model_kwargs['position_ids'] = new_position_rows[0].unsqueeze(0)
+        else:
+            model_kwargs['position_ids'] = None
     else:
-        model_kwargs['position_ids'] = None
+        # Pad to uniform length across batch
+        max_len = max(r.shape[0] for r in new_rows)
+        pad_id = getattr(model.config, 'pad_token_id', None)
+        if pad_id is None:
+            pad_id = getattr(model.config, 'eos_token_id', 0)
 
-    model_kwargs['attention_mask'] = new_attention_mask
+        new_input_ids = torch.full((batch_size, max_len), pad_id, dtype=input_ids.dtype, device=device)
+        new_attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
+        for b, r in enumerate(new_rows):
+            new_input_ids[b, :r.shape[0]] = r
+            new_attention_mask[b, :r.shape[0]] = 1
+
+        if is_prune_agnostic:
+            new_position_ids = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
+            for b, p in enumerate(new_position_rows):
+                new_position_ids[b, :p.shape[0]] = p
+            model_kwargs['position_ids'] = new_position_ids
+        else:
+            model_kwargs['position_ids'] = None
+
+        model_kwargs['attention_mask'] = new_attention_mask
 
     # ------------------------------------------------------------------
     # KV cache handling
@@ -460,8 +467,6 @@ def _sample(
         _pos_ids_buf = torch.zeros(
             (batch_size, _buf_len), dtype=torch.long, device=input_ids.device,
         )
-        # Signal to _update_model_kwargs_for_generation to skip concatenation
-        model_kwargs["_pos_ids_buf"] = True
 
     # Assisted generation completes the prefill stage in candidate generator so that
     # we don't have several `prefill` calls in one generation loop. Skip `_prefill` for assistants
@@ -483,6 +488,7 @@ def _sample(
             outputs, # type: ignore The value is always initialized
             model_kwargs,
             is_encoder_decoder=model.config.is_encoder_decoder,
+            use_pos_ids_buf=(_pos_ids_buf is not None),
         )
 
         # Extend position_ids via buffer instead of torch.cat (prune-agnostic mode)
@@ -516,10 +522,6 @@ def _sample(
         if has_eos_stopping_criteria:
             next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
 
-        if return_unpruned_output:
-            for b in range(batch_size):
-                unpruned_ids[b].append(next_tokens[b].item())
-
         # update generated ids, model inputs, and length for next step
         # Write into pre-allocated buffer instead of O(n²) torch.cat
         _ids_buf[:, _cur_len] = next_tokens
@@ -529,21 +531,25 @@ def _sample(
         if streamer is not None:
             streamer.put(next_tokens.cpu())
 
-        last_token = next_tokens.view(-1)
         pos = input_ids.shape[1] - 1
 
         # Single GPU→CPU transfer; all comparisons on CPU to avoid
         # multiple synchronization stalls per token step.
-        last_token_cpu = last_token.cpu()
+        # Also used by return_unpruned_output to avoid per-element GPU syncs.
+        next_tokens_cpu = next_tokens.cpu()
 
-        for b in (last_token_cpu == thought_token_id).nonzero(as_tuple=True)[0].tolist():
+        if return_unpruned_output:
+            for b in range(batch_size):
+                unpruned_ids[b].append(next_tokens_cpu[b].item())
+
+        for b in (next_tokens_cpu == thought_token_id).nonzero(as_tuple=True)[0].tolist():
             stacks[b].append([pos, None, None])
 
-        for b in (last_token_cpu == solution_token_id).nonzero(as_tuple=True)[0].tolist():
+        for b in (next_tokens_cpu == solution_token_id).nonzero(as_tuple=True)[0].tolist():
             if stacks[b]:
                 stacks[b][-1][1] = pos
 
-        is_return = last_token_cpu == return_token_id
+        is_return = next_tokens_cpu == return_token_id
         for b in is_return.nonzero(as_tuple=True)[0].tolist():
             if stacks[b]:
                 stacks[b][-1][2] = pos
@@ -561,17 +567,17 @@ def _sample(
                 model_kwargs=model_kwargs,
                 retain_kv_cache=retain_kv_cache,
             )
-            # Copy pruned result back into the pre-allocated buffer
+            # Copy pruned result back into the pre-allocated buffer.
+            # No need to zero the tail — it was initialized to pad_id and
+            # input_ids is always sliced to _cur_len so stale data is never read.
             _cur_len = input_ids.shape[1]
             _ids_buf[:, :_cur_len] = input_ids
-            _ids_buf[:, _cur_len:] = _pad_id_scalar
             input_ids = _ids_buf[:, :_cur_len]
 
             # Sync position_ids into buffer after pruning (prune-agnostic mode)
             if _pos_ids_buf is not None and model_kwargs.get("position_ids") is not None:
                 pos_ids = model_kwargs["position_ids"]
                 _pos_ids_buf[:, :pos_ids.shape[1]] = pos_ids
-                _pos_ids_buf[:, pos_ids.shape[1]:] = 0
                 model_kwargs["position_ids"] = _pos_ids_buf[:, :pos_ids.shape[1]]
 
         unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores) # type: ignore
@@ -580,9 +586,6 @@ def _sample(
         # This is needed to properly delete outputs.logits which may be very large for first iteration
         # Otherwise a reference to outputs is kept which keeps the logits alive in the next iteration
         del outputs # type: ignore
-
-    # Clean up internal buffer sentinel from model_kwargs
-    model_kwargs.pop("_pos_ids_buf", None)
 
     if streamer is not None:
         streamer.end()
