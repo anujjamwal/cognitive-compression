@@ -18,6 +18,9 @@ def main():
     parser = argparse.ArgumentParser(description="GRPO training worker")
     parser.add_argument("--model-name", default="anujjamwal/OpenMath-Nemotron-1.5B-hcot")
     parser.add_argument("--grpo-repo-id", default="anujjamwal/OpenMath-Nemotron-1.5B-hcot-grpo")
+    parser.add_argument("--dataset", default="davidanugraha/OpenMathReasoning-Sampled")
+    parser.add_argument("--dataset-offset", type=int, default=0)
+    parser.add_argument("--dataset-limit", type=int, default=1000)
     parser.add_argument("--num-generations", type=int, default=4)
     parser.add_argument("--num-epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -88,9 +91,10 @@ def main():
     )
 
     raw_dataset = load_dataset(
-        "anujjamwal/OpenMathReasoning-Sampled-Hierarchical-Cot",
+        args.dataset,
         split="train",
-    ).filter(lambda ex: len(ex["hierarchical_cot"]) > 50)
+    ).filter(lambda ex: len(ex["hierarchical_cot"]) > 50).skip(args.dataset_offset).take(args.dataset_limit)
+
     if is_main:
         print(f"Dataset size: {len(raw_dataset)}")
 
