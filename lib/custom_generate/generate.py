@@ -100,6 +100,14 @@ def _retain_and_prune_kv_cache(
             idx_expanded = idx[:, None, :, None].expand(-1, num_heads, -1, head_dim)
             new_keys = torch.gather(old_keys, 2, idx_expanded)
             new_vals = torch.gather(old_vals, 2, idx_expanded)
+            # Zero out padding positions beyond each element's prefix.
+            # Without this, gather copies position-0 values into padding slots,
+            # which FA2 would attend to (it ignores attention masks).
+            for b in range(batch_size):
+                n = prefix_lengths[b]
+                if n < max_new_seq:
+                    new_keys[b, :, n:, :] = 0
+                    new_vals[b, :, n:, :] = 0
 
         if use_layers_api:
             cache.layers[layer_idx].keys = new_keys
@@ -528,15 +536,15 @@ def _sample(
         _cur_len += 1
         input_ids = _ids_buf[:, :_cur_len]
 
-        if streamer is not None:
-            streamer.put(next_tokens.cpu())
-
-        pos = input_ids.shape[1] - 1
-
         # Single GPU→CPU transfer; all comparisons on CPU to avoid
         # multiple synchronization stalls per token step.
-        # Also used by return_unpruned_output to avoid per-element GPU syncs.
+        # Also used by streamer and return_unpruned_output.
         next_tokens_cpu = next_tokens.cpu()
+
+        if streamer is not None:
+            streamer.put(next_tokens_cpu)
+
+        pos = input_ids.shape[1] - 1
 
         if return_unpruned_output:
             for b in range(batch_size):
