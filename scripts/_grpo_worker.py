@@ -44,6 +44,7 @@ def main():
         compression_reward,
         format_reward,
     )
+    from custom_generate import generate
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     is_main = local_rank == 0
@@ -191,6 +192,11 @@ def main():
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
         max_prompt_length=512,
+        generation_kwargs={
+            "custom_generate": generate._sample,
+            "processing_class": tokenizer,
+            "return_unpruned_output": True,
+        },
 
         # Optimisation
         num_train_epochs=args.num_epochs,
