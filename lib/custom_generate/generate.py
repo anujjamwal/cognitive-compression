@@ -123,6 +123,18 @@ def _prepare_inputs_for_generation(
     is_first_iteration: bool | None = False,
     **kwargs,
 ):
+    # After a prune event, cache_position covers only the solution tokens
+    # that need re-processing (fewer than input_ids).  The standard
+    # prepare_inputs_for_generation expects them to match, so pre-slice
+    # input_ids to the tokens at cache_position.  This also handles the
+    # normal decode case where cache_position is a single element.
+    if (
+        cache_position is not None
+        and past_key_values is not None
+        and input_ids.shape[1] != cache_position.shape[0]
+    ):
+        input_ids = input_ids[:, cache_position]
+
     model_inputs = GenerationMixin.prepare_inputs_for_generation(
         model,
         input_ids,
@@ -150,6 +162,17 @@ def _update_model_kwargs_for_generation(
         is_encoder_decoder=is_encoder_decoder,
         num_new_tokens=num_new_tokens
     )
+
+    # HF's _update concatenates new positions onto cache_position, which is
+    # correct for the initial prefill→decode transition but breaks after a
+    # prune: the multi-element cache_position from _prune_model_inputs gets
+    # carried forward, causing prepare_inputs_for_generation to re-select
+    # already-cached tokens on every subsequent step.  DynamicCache.update()
+    # appends these duplicates, inflating the cache until old_seq_len exceeds
+    # the pruned input length and torch.arange crashes.  Fix: always keep
+    # only the last element (the next decode position).
+    if "cache_position" in model_kwargs and model_kwargs["cache_position"] is not None:
+        model_kwargs["cache_position"] = model_kwargs["cache_position"][-1:]
 
     # HF's _update_model_kwargs_for_generation does not manage position_ids.
     # For prune-agnostic mode we track position_ids explicitly after each

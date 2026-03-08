@@ -62,7 +62,7 @@ SECRETS = [
 # ---------------------------------------------------------------------------
 
 @app.function(
-    gpu=modal.gpu.A100(count=4),
+    gpu="A100-40GB:4",
     timeout=6 * 3600,
     secrets=SECRETS,
     volumes={"/checkpoints": vol},
