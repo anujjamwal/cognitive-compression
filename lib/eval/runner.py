@@ -281,7 +281,7 @@ def run_eval(
                 gen_kwargs["processing_class"] = tokenizer
 
             t0 = time.time()
-            with torch.no_grad():
+            with torch.inference_mode():
                 out = model.generate(**gen_kwargs)
             wall_time = time.time() - t0
 

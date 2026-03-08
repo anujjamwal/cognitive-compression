@@ -88,7 +88,20 @@ def main():
     dtype = dtype_map[args.dtype]
 
     logger.info("Loading model: %s (dtype=%s)", args.model_path, args.dtype)
-    model = AutoModelForCausalLM.from_pretrained(args.model_path, dtype=dtype, device_map="auto")
+    # Prefer flash_attention_2 for faster inference on A100.  Safe during
+    # inference because only 2D attention masks are used (4D hierarchical
+    # masks that FA2 ignores are only used during training).
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path, dtype=dtype, device_map="auto",
+            attn_implementation="flash_attention_2",
+        )
+    except (ImportError, ValueError):
+        logger.warning("Flash Attention 2 unavailable, falling back to sdpa")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path, dtype=dtype, device_map="auto",
+            attn_implementation="sdpa",
+        )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
 
     if args.prepare_base_model:
