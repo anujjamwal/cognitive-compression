@@ -513,7 +513,14 @@ def _sample(
         return input_ids
 
 
-def generate(model, processing_class = None, retain_kv_cache: bool = True, return_unpruned_output: bool = False, **kwargs):
+def generate(
+    model, 
+    processing_class = None, 
+    retain_kv_cache: bool = True, 
+    return_unpruned_output: bool = False, 
+    prune_aware: bool = True,
+    **kwargs
+):
     """Custom generate method for Hierarchical Chain of Thought.
 
     Args:
@@ -530,5 +537,6 @@ def generate(model, processing_class = None, retain_kv_cache: bool = True, retur
         processing_class=processing_class,
         retain_kv_cache=retain_kv_cache,
         return_unpruned_output=return_unpruned_output,
+        prune_aware=prune_aware,
         **kwargs
     )

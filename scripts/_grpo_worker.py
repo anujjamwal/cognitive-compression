@@ -193,7 +193,6 @@ def main():
         max_completion_length=args.max_completion_length,
         max_prompt_length=512,
         generation_kwargs={
-            "custom_generate": generate._sample,
             "processing_class": tokenizer,
             "return_unpruned_output": True,
         },
