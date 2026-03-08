@@ -225,7 +225,7 @@ def main():
         bf16=True,
         gradient_checkpointing=True,
         mask_truncated_completions=True,
-        torch_compile=True,
+        torch_compile=False,
 
         # Reward weighting
         reward_weights=reward_weights,
