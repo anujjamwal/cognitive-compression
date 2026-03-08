@@ -2,7 +2,8 @@ from typing import Any, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
-from transformers import  Cache, DynamicCache, LogitsProcessorList, StoppingCriteriaList
+from trl.trainer.utils import get_config_model_id
+from transformers import  AutoProcessor, Cache, DynamicCache, LogitsProcessorList, ProcessorMixin, StoppingCriteriaList
 from transformers.generation.utils import GenerationMixin, ALL_CACHE_NAMES, GenerateEncoderDecoderOutput, GenerateDecoderOnlyOutput
 from transformers.generation.configuration_utils import GenerationConfig
 from transformers.generation.streamers import BaseStreamer
@@ -350,6 +351,24 @@ def _sample(
         - Manages KV-cache through model_kwargs for efficient decoding.
     """
 
+    
+    if processing_class is None:
+        processing_class = AutoProcessor.from_pretrained(
+            get_config_model_id(model.config), truncation_side="left", padding_side="left"
+        )
+
+        # Handle pad token for processors or tokenizers
+        if isinstance(processing_class, ProcessorMixin):
+            tokenizer = processing_class.tokenizer
+        elif isinstance(processing_class, PreTrainedTokenizerBase):
+            tokenizer = processing_class
+        else:
+            raise TypeError("The `processing_class` must be either a `PreTrainedTokenizerBase` or a `ProcessorMixin`")
+
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+
     thought_token_id = processing_class.convert_tokens_to_ids("[THOUGHT]")
     solution_token_id = processing_class.convert_tokens_to_ids("[SOLUTION]")
     return_token_id = processing_class.convert_tokens_to_ids("[RETURN]")
@@ -531,9 +550,11 @@ def generate(
             discards the cache entirely.
         **kwargs: Forwarded to ``model.generate``.
     """
+    custom_generate = kwargs.pop('custom_generate', _sample)
 
-    return model.generate(
-        custom_generate=_sample,
+    return GenerationMixin.generate(
+        model,
+        custom_generate=custom_generate,
         processing_class=processing_class,
         retain_kv_cache=retain_kv_cache,
         return_unpruned_output=return_unpruned_output,

@@ -99,7 +99,6 @@ def main():
         # No device_map="auto" — let Accelerate/DeepSpeed handle placement
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    model, tokenizer = prepare_base_model(model, tokenizer)
 
     # ---- Dataset ----
     SYSTEM_PROMPT = (
