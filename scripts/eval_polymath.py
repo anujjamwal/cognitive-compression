@@ -10,14 +10,12 @@ Usage examples:
     python scripts/eval_polymath.py \\
         --model-path nvidia/OpenMath-Nemotron-1.5B \\
         --output-dir results/polymath-baseline \\
-        --modes baseline \\
         --batch-size 4
 
     # HCoT model on easy problems only:
     python scripts/eval_polymath.py \\
         --model-path anujjamwal/OpenMath-Nemotron-1.5B-PruneAware \\
         --output-dir results/polymath-hcot-top \\
-        --modes hcot \\
         --levels top \\
         --batch-size 4
 
@@ -25,7 +23,6 @@ Usage examples:
     python scripts/eval_polymath.py \\
         --model-path nvidia/OpenMath-Nemotron-1.5B \\
         --output-dir results/polymath-baseline \\
-        --modes baseline \\
         --batch-size 4
 """
 
@@ -42,22 +39,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lib"))
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from eval import PolyMathBenchmark, run_eval, summarize_results
-from eval.runner import GenerationMode
-from custom_generate.generate import _sample
-from trainer import prepare_base_model
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-
-AVAILABLE_MODES = {
-    "baseline": GenerationMode(name="Baseline", generate_fn=None, kwargs={"use_cache": True}),
-    "hcot": GenerationMode(name="HCoT Prune", generate_fn=_sample, kwargs={"use_cache": True, "prune_aware": True}),
-    "hcot-agnostic": GenerationMode(name="HCoT Prune-Agnostic", generate_fn=_sample, kwargs={"use_cache": True, "prune_aware": False}),
-}
 
 VALID_LEVELS = ["top", "high", "middle", "low"]
 
@@ -68,16 +55,12 @@ def parse_args():
     p.add_argument("--output-dir", required=True, help="Directory for checkpoint/result files")
     p.add_argument("--language", default="en", help="Language config (default: en)")
     p.add_argument("--dataset-id", default="Qwen/PolyMath", help="HuggingFace dataset ID")
-    p.add_argument("--modes", nargs="+", default=["baseline"], choices=list(AVAILABLE_MODES.keys()),
-                    help="Generation modes to evaluate")
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--max-new-tokens", type=int, default=4096)
     p.add_argument("--levels", nargs="*", default=None, choices=VALID_LEVELS,
                     help="Filter by difficulty level (top=easiest, low=hardest)")
     p.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"],
                     help="Model dtype (default: bfloat16)")
-    p.add_argument("--prepare-base-model", action="store_true",
-                    help="Run prepare_base_model to add special tokens (needed for HCoT models)")
     return p.parse_args()
 
 
@@ -104,10 +87,6 @@ def main():
         )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
 
-    if args.prepare_base_model:
-        logger.info("Preparing base model (adding special tokens)")
-        model, tokenizer = prepare_base_model(model, tokenizer)
-
     model.eval()
 
     benchmark = PolyMathBenchmark()
@@ -120,21 +99,18 @@ def main():
     )
     logger.info("Loaded %d problems", len(problems))
 
-    modes = [AVAILABLE_MODES[m] for m in args.modes]
-
     results = run_eval(
-        model, tokenizer, problems, args.output_dir, modes,
+        model, tokenizer, problems, args.output_dir,
         benchmark=benchmark,
         batch_size=args.batch_size,
         max_new_tokens=args.max_new_tokens,
+        generate_kwargs={'processing_class': tokenizer, "temperature": 0.7, "top_p": 0.9, "do_sample": True},
     )
 
     summary = summarize_results(results)
     print("\n=== PolyMath Evaluation Summary ===")
     print(f"Language: {args.language}")
     print(f"Total: {summary['correct']}/{summary['total']} ({summary['accuracy']:.1%})")
-    for mode, stats in summary.get("by_mode", {}).items():
-        print(f"  {mode}: {stats['correct']}/{stats['total']} ({stats['accuracy']:.1%})")
     for level, stats in summary.get("by_level", {}).items():
         print(f"  Level [{level}]: {stats['correct']}/{stats['total']} ({stats['accuracy']:.1%})")
     print(f"\nResults saved to: {args.output_dir}")

@@ -21,6 +21,17 @@ def convert_to_trl(example, think_key="hierarchical_cot", output_key="expected_a
     }
 
 
+def convert_to_trl_prompt(example, question_key="question"):
+    prompt = "Solve the following math problem. Make sure to put the answer (and only answer) inside \\boxed{}."
+    
+    return {
+        "prompt": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": example[question_key]},
+        ],
+    }
+
+
 def prepare_prune_aware(
     batch, 
     tokenizer: PreTrainedTokenizer, 
