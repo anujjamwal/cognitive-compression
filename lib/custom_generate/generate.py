@@ -367,7 +367,9 @@ def _sample(
     logits_processor: LogitsProcessorList,
     stopping_criteria: StoppingCriteriaList,
     generation_config: GenerationConfig,
-    processing_class: Optional[PreTrainedTokenizerBase] = None,
+    thought_token_id: int,
+    solution_token_id: int,
+    return_token_id: int,
     synced_gpus: bool = False,
     streamer: Optional["BaseStreamer"] = None,
     prune_aware: bool = True,
@@ -385,7 +387,9 @@ def _sample(
         logits_processor (LogitsProcessorList): List of processors to apply to logits before sampling.
         stopping_criteria (StoppingCriteriaList): List of criteria to determine when to stop generation.
         generation_config (GenerationConfig): Configuration object containing generation parameters.
-        processing_class (Optional[PreTrainedTokenizerBase]): Tokenizer for token-id conversion. Defaults to None.
+        thought_token_id (int): Token ID for [THOUGHT].
+        solution_token_id (int): Token ID for [SOLUTION].
+        return_token_id (int): Token ID for [RETURN].
         synced_gpus (bool): Whether GPUs are synchronized for multi-device generation. Defaults to False.
         streamer (Optional[BaseStreamer]): Optional streamer to output tokens during generation. Defaults to None.
         prune_aware (bool): When True, positions are renumbered after pruning (contiguous). Defaults to True.
@@ -405,29 +409,6 @@ def _sample(
         - Handles batch generation with unfinished sequences tracking.
         - Manages KV-cache through model_kwargs for efficient decoding.
     """
-
-    
-    if processing_class is None:
-        processing_class = AutoProcessor.from_pretrained(
-            get_config_model_id(model.config), truncation_side="left", padding_side="left"
-        )
-
-        # Handle pad token for processors or tokenizers
-        if isinstance(processing_class, ProcessorMixin):
-            tokenizer = processing_class.tokenizer
-        elif isinstance(processing_class, PreTrainedTokenizerBase):
-            tokenizer = processing_class
-        else:
-            raise TypeError("The `processing_class` must be either a `PreTrainedTokenizerBase` or a `ProcessorMixin`")
-
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-    else:
-        tokenizer = processing_class
-
-    thought_token_id = tokenizer.convert_tokens_to_ids("[THOUGHT]")
-    solution_token_id = tokenizer.convert_tokens_to_ids("[SOLUTION]")
-    return_token_id = tokenizer.convert_tokens_to_ids("[RETURN]")
 
     pad_token_id = generation_config._pad_token_tensor # type: ignore
     output_attentions = generation_config.output_attentions
@@ -658,7 +639,7 @@ def _sample(
 
 def generate(
     model, 
-    processing_class = None, 
+    tokenizer: PreTrainedTokenizerBase, 
     retain_kv_cache: bool = True, 
     return_unpruned_output: bool = False, 
     prune_aware: bool = True,
@@ -668,18 +649,23 @@ def generate(
 
     Args:
         model: The language model.
-        processing_class: Tokenizer / processing class.
+        tokenizer: Tokenizer.
         retain_kv_cache: When True (default), retains the prefix in the KV
             cache after pruning and re-processes solution tokens.  When False,
             discards the cache entirely.
         **kwargs: Forwarded to ``model.generate``.
     """
     custom_generate = kwargs.pop('custom_generate', _sample)
+    thought_token_id = tokenizer.convert_tokens_to_ids('[THOUGHT]')
+    solution_token_id = tokenizer.convert_tokens_to_ids('[SOLUTION]')
+    return_token_id = tokenizer.convert_tokens_to_ids('[RETURN]')
 
     return GenerationMixin.generate(
         model,
         custom_generate=custom_generate,
-        processing_class=processing_class,
+        thought_token_id=thought_token_id,
+        solution_token_id=solution_token_id,
+        return_token_id=return_token_id,
         retain_kv_cache=retain_kv_cache,
         return_unpruned_output=return_unpruned_output,
         prune_aware=prune_aware,
