@@ -546,7 +546,7 @@ def _sample(
         _any_special = (_is_thought | _is_solution | _is_return).any()
         
         if _any_special.item():
-            for b in _is_solution.nonzero(as_tuple=True)[0].tolist():
+            for b in _is_thought.nonzero(as_tuple=True)[0].tolist():
                 if stacks[b]:
                     stacks[b][-1][1] = pos
 
