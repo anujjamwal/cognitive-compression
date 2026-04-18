@@ -6,9 +6,15 @@ Marker semantics:
     <return|>      end of sub-chain-of-thought    (prune trigger)
 
 When `<return|>` is emitted, the pruner walks the stack to the matching
-`<|channel>` open, truncates the KV cache back to that position, and re-runs
-the post-`<channel|>` tokens (the "summary paragraph") under renumbered
-contiguous positions.
+`<|channel>` open and rewrites the visible sequence to drop ALL THREE
+markers along with the thought content:
+
+    before:  [..prefix..] <|channel> <thought> <channel|> <summary> <return|>
+    after:   [..prefix..] <summary>
+
+The KV cache is truncated to the prefix length (excluding `<|channel>`), and
+the next forward pass re-RoPEs the summary tokens at renumbered positions
+`[open_pos, open_pos+1, ...]`.
 
 Strategy 1A: prune every layer's cache to the prefix length.  Per-layer KV
 shape and head dim are read inside the loop because Gemma 4 sliding layers
@@ -18,9 +24,17 @@ entry — we skip them.
 
 Sliding-layer coherence: the prefix's cached K/V keeps its original RoPE
 positions, which are unchanged by the renumber (we renumber only positions
-*after* the prune point).  The next forward pass appends re-processed summary
-tokens with positions `[open_pos+1, ...]`, monotonically continuing the
-prefix.  The sliding window's eviction logic then trims naturally.
+at and after the prune point).  The next forward pass appends re-processed
+summary tokens with positions `[open_pos, open_pos+1, ...]`, monotonically
+continuing the prefix.  The sliding window's eviction logic then trims
+naturally.
+
+Training-data invariant for this scheme: post-prune stages must show the
+model `[prefix, summary]` without any of the three markers, so it learns to
+continue from the summary as if it were plain text — and in particular,
+never predicts `<return|>` as the next token from a fresh post-prune
+context (which would be ill-formed since there is no matching `<|channel>`
+in the visible context).
 """
 from __future__ import annotations
 
@@ -49,17 +63,21 @@ from .markers import CHANNEL_CLOSE_TOKEN, CHANNEL_OPEN_TOKEN, RETURN_TOKEN
 
 def _truncate_kv_cache_layer_aware(
     cache: DynamicCache,
-    prune_map: dict[int, Tuple[int, int]],
+    prune_map: dict[int, Tuple[int, int, int]],
     batch_size: int,
     old_seq_len: int,
 ) -> int:
     """Truncate a hybrid KV cache to per-element prefix lengths.
 
-    For each batch element in `prune_map`, retain only `[0..open_pos]` of the
-    cached K/V at every layer; non-pruned elements keep the full cache.  Per-
+    For each batch element in `prune_map`, retain only `[0..open_pos)` of the
+    cached K/V at every layer (i.e. drop `<|channel>` itself along with
+    everything after it).  Non-pruned elements keep the full cache.  Per-
     layer head_dim is read from each layer's tensor (Gemma 4: sliding=256,
     global=512).  Layers without an own cache entry (KV-shared tail) are
     skipped silently.
+
+    `prune_map` values are `(open_pos, close_pos, return_pos)`; only
+    `open_pos` is used here.
 
     Returns the new sequence length (max prefix length across the batch).
     """
@@ -75,12 +93,13 @@ def _truncate_kv_cache_layer_aware(
     if num_layers == 0:
         return 0
 
-    # Per-element prefix lengths.  Pruned -> open_pos+1; otherwise full length.
+    # Per-element prefix lengths.  Pruned -> open_pos (drop the `<|channel>`
+    # token itself along with everything after); otherwise full length.
     prefix_lengths: list[int] = []
     for b in range(batch_size):
         if b in prune_map:
-            open_pos, _close_pos = prune_map[b]
-            prefix_lengths.append(open_pos + 1)
+            open_pos, _close_pos, _return_pos = prune_map[b]
+            prefix_lengths.append(open_pos)
         else:
             prefix_lengths.append(old_seq_len)
 
@@ -208,20 +227,21 @@ def _prune_model_inputs(
     input_ids: torch.LongTensor,
     model_kwargs: dict[str, Any],
 ) -> Tuple[torch.LongTensor, dict[str, Any]]:
-    """Prune-aware: drop `[<channel|>` thought content `<channel|>]` from
-    input_ids, truncate KV cache to the `<|channel>` prefix, set
-    `cache_position` so the next forward re-processes the summary + `<return|>`
-    tokens against the cached prefix.
+    """Prune-aware: drop `<|channel>`, the thought content, `<channel|>`, and
+    `<return|>` from input_ids; truncate KV cache to the prefix that
+    immediately precedes `<|channel>`; set `cache_position` so the next
+    forward re-processes the summary tokens against the cached prefix.
     """
     batch_size = input_ids.shape[0]
     device = input_ids.device
 
-    # batch index -> (open_pos, close_pos) — only entries with a matched close
-    prune_map: dict[int, Tuple[int, int]] = {}
+    # batch index -> (open_pos, close_pos, return_pos)
+    # Only entries with a matched close are eligible.
+    prune_map: dict[int, Tuple[int, int, int]] = {}
     for cand_idx, batch_idx in enumerate(prune_input_candidates):
-        for open_pos, close_pos, _return_pos in prune_input_locations[cand_idx]:
-            if close_pos is not None:
-                prune_map[batch_idx] = (open_pos, close_pos)
+        for open_pos, close_pos, return_pos in prune_input_locations[cand_idx]:
+            if close_pos is not None and return_pos is not None:
+                prune_map[batch_idx] = (open_pos, close_pos, return_pos)
 
     if not prune_map:
         return input_ids, model_kwargs
@@ -243,17 +263,17 @@ def _prune_model_inputs(
         and cache_populated
     )
 
-    # Build pruned rows: keep [0..open_pos] + [close_pos..] for pruned elements.
-    # We retain BOTH `<|channel>` and `<channel|>` (with empty content between
-    # them) so the channel pair remains well-formed.  This keeps `strip_thinking`
-    # happy on multi-turn replays (it sees an empty thought channel and a
-    # standalone summary outside it) and avoids leaving a dangling open marker.
+    # Build pruned rows: keep [0..open_pos) + [close_pos+1..return_pos)
+    # for pruned elements.  All three markers are dropped along with the
+    # thought content; only the summary survives.
     new_rows: list[torch.Tensor] = []
     for b in range(batch_size):
         if b in prune_map:
-            open_pos, close_pos = prune_map[b]
+            open_pos, close_pos, return_pos = prune_map[b]
             new_rows.append(
-                torch.cat((input_ids[b, : open_pos + 1], input_ids[b, close_pos:]))
+                torch.cat(
+                    (input_ids[b, :open_pos], input_ids[b, close_pos + 1 : return_pos])
+                )
             )
         else:
             new_rows.append(input_ids[b])

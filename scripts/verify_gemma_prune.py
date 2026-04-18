@@ -96,11 +96,11 @@ def test_token_init(model, tokenizer) -> None:
 # Test 2: prune parity
 # ---------------------------------------------------------------------------
 
-def _build_test_sequence(tokenizer, device) -> tuple[torch.Tensor, torch.Tensor, int, int]:
-    """Construct (full_ids, pruned_ref_ids, open_pos, close_pos).
+def _build_test_sequence(tokenizer, device) -> tuple[torch.Tensor, torch.Tensor, int, int, int]:
+    """Construct (full_ids, pruned_ref_ids, open_pos, close_pos, return_pos).
 
     full sequence:    "<prompt><|channel>thought\\n<thought><channel|><summary><return|>"
-    pruned reference: "<prompt><|channel><channel|><summary><return|>"  (thought removed)
+    pruned reference: "<prompt><summary>"   (all three markers + thought removed)
     """
     open_id = tokenizer.convert_tokens_to_ids(CHANNEL_OPEN_TOKEN)
     close_id = tokenizer.convert_tokens_to_ids(CHANNEL_CLOSE_TOKEN)
@@ -127,18 +127,13 @@ def _build_test_sequence(tokenizer, device) -> tuple[torch.Tensor, torch.Tensor,
     )
     open_pos = len(prompt_ids)
     close_pos = open_pos + 1 + len(thought_text_ids)
+    return_pos = close_pos + 1 + len(summary_ids)
 
-    pruned_ref = (
-        prompt_ids
-        + [open_id]
-        + [close_id]
-        + summary_ids
-        + [return_id]
-    )
+    pruned_ref = prompt_ids + summary_ids
 
     full_t = torch.tensor([full], dtype=torch.long, device=device)
     pruned_ref_t = torch.tensor([pruned_ref], dtype=torch.long, device=device)
-    return full_t, pruned_ref_t, open_pos, close_pos
+    return full_t, pruned_ref_t, open_pos, close_pos, return_pos
 
 
 @torch.no_grad()
@@ -152,10 +147,12 @@ def test_prune_parity(model, tokenizer, atol: float = 5e-2, rtol: float = 5e-2) 
     logger.info("=== Test 2: prune-correctness parity ===")
     device = next(model.parameters()).device
 
-    full_ids, ref_ids, open_pos, close_pos = _build_test_sequence(tokenizer, device)
+    full_ids, ref_ids, open_pos, close_pos, return_pos = _build_test_sequence(
+        tokenizer, device,
+    )
     logger.info(
-        "full_len=%d  ref_len=%d  open_pos=%d  close_pos=%d",
-        full_ids.shape[1], ref_ids.shape[1], open_pos, close_pos,
+        "full_len=%d  ref_len=%d  open_pos=%d  close_pos=%d  return_pos=%d",
+        full_ids.shape[1], ref_ids.shape[1], open_pos, close_pos, return_pos,
     )
 
     # ---- Reference: single forward on the post-prune sequence ----
@@ -164,12 +161,11 @@ def test_prune_parity(model, tokenizer, atol: float = 5e-2, rtol: float = 5e-2) 
 
     # ---- Prune path: forward full -> truncate cache -> forward suffix ----
     cache = DynamicCache(config=model.config)
-    pre_out = model(input_ids=full_ids, past_key_values=cache, use_cache=True)
-    # Sanity: cache should hold every token we just processed.
+    _ = model(input_ids=full_ids, past_key_values=cache, use_cache=True)
     cache_len_before = full_ids.shape[1]
     logger.info("cache populated to length %d", cache_len_before)
 
-    prune_map = {0: (open_pos, close_pos)}
+    prune_map = {0: (open_pos, close_pos, return_pos)}
     new_cache_len = _truncate_kv_cache_layer_aware(
         cache=cache,
         prune_map=prune_map,
@@ -177,17 +173,17 @@ def test_prune_parity(model, tokenizer, atol: float = 5e-2, rtol: float = 5e-2) 
         old_seq_len=cache_len_before,
     )
     logger.info("after truncate: cache length = %d (expected %d)",
-                new_cache_len, open_pos + 1)
-    assert new_cache_len == open_pos + 1, (
-        f"Truncated cache length {new_cache_len} != expected {open_pos + 1}"
+                new_cache_len, open_pos)
+    assert new_cache_len == open_pos, (
+        f"Truncated cache length {new_cache_len} != expected {open_pos}"
     )
 
-    # The post-prune visible sequence equals ref_ids; the cache holds
-    # [0..open_pos], so the next forward should re-process [<channel|>, summary..., <return|>]
-    # at positions [open_pos+1 ..].
-    suffix = ref_ids[:, open_pos + 1 :]
+    # Post-prune visible sequence equals ref_ids = prefix + summary.
+    # Cache holds [0..open_pos), so next forward re-processes the summary
+    # tokens at positions [open_pos, open_pos+1, ...].
+    suffix = ref_ids[:, open_pos:]
     cache_position = torch.arange(
-        open_pos + 1, ref_ids.shape[1], dtype=torch.long, device=device,
+        open_pos, ref_ids.shape[1], dtype=torch.long, device=device,
     )
     post_out = model(
         input_ids=suffix,
