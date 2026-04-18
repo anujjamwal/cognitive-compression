@@ -239,8 +239,7 @@ def main():
         args.model,
         torch_dtype=dtype,
         attn_implementation=args.attn,
-        device_map=args.device,
-    )
+    ).to(args.device)
     model.eval()
 
     model, tokenizer = prepare_gemma_model(model, tokenizer)
