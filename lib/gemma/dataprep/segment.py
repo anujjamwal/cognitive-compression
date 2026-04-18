@@ -87,11 +87,17 @@ def parse_result(text: str) -> tuple[str, str]:
 def segment_trace(
     question: str,
     raw_trace: str,
+    final_answer: str,
     expected_answer: str,
     model: str | None = None,
     output_file: str | None = None,
 ) -> tuple[str, str]:
-    """Segment a single (question, raw_trace, expected_answer) record.
+    """Segment a single (question, raw_trace, final_answer, expected_answer)
+    record.
+
+    `raw_trace` is Gemma's thinking body ending with `<channel|>`.
+    `final_answer` is Gemma's own answer text that followed the outer close.
+    `expected_answer` is ground truth from the source dataset.
 
     If `output_file` exists and is non-empty, return its cached contents
     without invoking the API.
@@ -109,6 +115,7 @@ def segment_trace(
     prompt = INPUT_TEMPLATE.format(
         question=question,
         raw_trace=raw_trace,
+        final_answer=final_answer,
         expected_answer=expected_answer,
     )
     text = _call_gemini(prompt, model=model)
@@ -149,6 +156,7 @@ def segment_batch(
             hcot, raw = segment_trace(
                 question=rec["question"],
                 raw_trace=rec["raw_trace"],
+                final_answer=rec.get("final_answer", ""),
                 expected_answer=rec.get("expected_answer", ""),
                 model=model,
                 output_file=output_file,

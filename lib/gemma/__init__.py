@@ -19,6 +19,12 @@ from .markers import (
     RETURN_TOKEN_SEED,
 )
 from .setup import prepare_gemma_model, DEFAULT_TOKEN_SEED
+from .dataset import (
+    collapse_nested,
+    convert_to_trl,
+    expand_to_variants,
+    install_sft_chat_template,
+)
 
 __all__ = [
     "THINK_TOKEN",
@@ -28,4 +34,8 @@ __all__ = [
     "RETURN_TOKEN_SEED",
     "prepare_gemma_model",
     "DEFAULT_TOKEN_SEED",
+    "collapse_nested",
+    "convert_to_trl",
+    "expand_to_variants",
+    "install_sft_chat_template",
 ]

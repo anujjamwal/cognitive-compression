@@ -96,6 +96,7 @@ def main() -> None:
         {
             "question": r["question"],
             "raw_trace": r["raw_trace"],
+            "final_answer": r.get("final_answer", ""),
             "expected_answer": r.get("expected_answer", ""),
         }
         for r in to_process

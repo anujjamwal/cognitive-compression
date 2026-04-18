@@ -153,11 +153,22 @@ INPUT_TEMPLATE = """\
 
 {question}
 
-### Raw Gemma trace
+### Raw Gemma trace (thinking only, ends with `<channel|>`)
 
 {raw_trace}
 
-### Expected answer
+### Gemma's final answer (follows the outer `<channel|>`)
+
+{final_answer}
+
+### Expected answer (ground truth, for reference only)
 
 {expected_answer}
+
+## Reminder
+
+Return a single `<hierarchical-cot>...</hierarchical-cot>` block containing
+the FULL segmented completion: the outer `<|channel>thought ... <channel|>`
+with nested sub-blocks inserted, followed by Gemma's final answer (not the
+expected answer).  Do not rewrite Gemma's answer.
 """
