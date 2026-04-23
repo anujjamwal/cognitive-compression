@@ -1,10 +1,11 @@
 """Orchestrator for the Gemma 4 hierarchical-CoT data pipeline.
 
-Stage 1 (`sample.py`) produces `{question, raw_trace, expected_answer, ...}`
-records by running an open-reasoning dataset through Gemma 4 with thinking
-enabled.  This script (stage 2) loads those records, calls Gemini via
-`segment.py` to annotate them with nested structure, validates the output,
-and pushes the resulting hierarchical dataset to the HF hub.
+Stage 1 produces `{question, raw_trace, expected_answer, ...}` records by
+running an open-reasoning dataset through a base Gemma 4 sampler (the JAX
+re-implementation of that stage will land in Phase 2 of the plan).  This
+script (stage 2) loads those records, calls Gemini via `segment.py` to
+annotate them with nested structure, validates the output, and pushes the
+resulting hierarchical dataset to the HF hub.
 
 Usage:
     python -m lib.gemma.dataprep.prepare \\

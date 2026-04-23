@@ -1,41 +1,17 @@
-"""Gemma 4 hierarchical-CoT pipeline (isolated from the Qwen2.5 codepath).
+"""Hierarchical-CoT data preparation for Gemma 4.
 
-Modules:
-    markers : project special-token name constants
-    setup   : model / tokenizer load + <return|> seeding (incl. PLE)
+Historically this package also housed a PyTorch/HF model-side implementation
+(pruner, SFT dataset wrappers, tokenizer+embedding seeding) — that path was
+retired when the project moved to the Google DeepMind gemma JAX repo.  The
+model-side code now lives in `lib/gemma_jax/`.
 
-Coming next:
-    generate : prune-aware generation with layer-aware KV pruning (1A)
-    dataset  : SFT data prep with Gemma chat template + nested thought blocks
-    trainer  : SFT trainer subclass (prune-aware staged loss only)
-    rewards  : general-purpose GRPO rewards
-    dataprep : Gemini hierarchization + open-reasoning sampling
+What remains here is the *model-agnostic* data pipeline:
+
+    dataprep.sample     (deleted; will be rewritten against lib/gemma_jax
+                         in Phase 2 of the plan)
+    dataprep.segment    Gemini 3.x hierarchization of raw reasoning traces.
+    dataprep.prepare    Orchestrator: stage-1 samples -> stage-2 hierarchical.
+    dataprep.prompts    Prompt templates for the teacher LLM.
+    dataprep.validate   Well-formedness checks on hierarchical traces.
+    dataprep.collapse   Pure-regex `collapse_nested` (shared by HF and JAX).
 """
-from .markers import (
-    THINK_TOKEN,
-    CHANNEL_OPEN_TOKEN,
-    CHANNEL_CLOSE_TOKEN,
-    RETURN_TOKEN,
-    RETURN_TOKEN_SEED,
-)
-from .setup import prepare_gemma_model, DEFAULT_TOKEN_SEED
-from .dataset import (
-    collapse_nested,
-    convert_to_trl,
-    expand_to_variants,
-    install_sft_chat_template,
-)
-
-__all__ = [
-    "THINK_TOKEN",
-    "CHANNEL_OPEN_TOKEN",
-    "CHANNEL_CLOSE_TOKEN",
-    "RETURN_TOKEN",
-    "RETURN_TOKEN_SEED",
-    "prepare_gemma_model",
-    "DEFAULT_TOKEN_SEED",
-    "collapse_nested",
-    "convert_to_trl",
-    "expand_to_variants",
-    "install_sft_chat_template",
-]
