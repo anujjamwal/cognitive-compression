@@ -6,7 +6,7 @@ Public entry points:
     from lib.gemma_jax import (
         make_gemma4_tokenizer,
         resolve_marker_ids,
-        HierarchicalGemma4Sampler,
+        PruningChatSampler,
         MarkerIds,
     )
 
@@ -20,15 +20,15 @@ from .markers import (
     RETURN_TOKEN,
     THINK_TOKEN,
 )
-from .prune_sampler import HierarchicalGemma4Sampler
+from .prune_sampler import PruningChatSampler
 from .setup import MarkerIds, make_gemma4_tokenizer, resolve_marker_ids
 
 __all__ = [
     "CHANNEL_CLOSE_TOKEN",
     "CHANNEL_OPEN_TOKEN",
     "DEFAULT_RETURN_TOKEN_SLOT",
-    "HierarchicalGemma4Sampler",
     "MarkerIds",
+    "PruningChatSampler",
     "RETURN_TOKEN",
     "THINK_TOKEN",
     "make_gemma4_tokenizer",
