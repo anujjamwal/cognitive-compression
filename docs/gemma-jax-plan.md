@@ -159,9 +159,9 @@ on a verified foundation.
 ```
 lib/gemma_jax/                 # added in Phase 1
   __init__.py
-  setup.py                     # tokenizer customization + return-token registration
+  setup.py                     # tokenizer customization + marker-ID resolution
   markers.py                   # token-name constants (port from lib/gemma/markers.py)
-  prune_sampler.py             # HierarchicalGemma4Sampler wrapping _stream_sample_loop
+  prune_sampler.py             # PruningChatSampler subclassing gm.text.ChatSampler
   dataset.py                   # added in Phase 2: Seq2SeqTask adapter + collapse_nested
   rewards.py                   # added in Phase 3: correctness / compression / format
   bench.py                     # added in Phase 4: accuracy/len/memory reporter
@@ -173,68 +173,120 @@ scripts/
   gemma_jax_benchmark.py       # Phase 4: MMLU / GSM8K / AIME / Polymath harness
 ```
 
+`PruningChatSampler` subclasses `gm.text.ChatSampler`.  `ChatSampler`
+is the stateful, multi-turn, multimodal-aware entry point that
+auto-detects the model and dispatches to the right inner sampler
+(`Gemma4Sampler` for Gemma 4, `Sampler` for earlier versions); it
+also owns `last_state` and the `turns` log.  Subclassing means our
+pruner slots in as a drop-in replacement — users write `chat(...)`,
+get cached multi-turn, native `dialog.Conversation` formatting,
+image/audio support, and transparent prune events on `<return|>`.
+
 The `lib/gemma/dataprep/` pipeline we already built (stage-1 sample
 Gemma traces, stage-2 Gemini hierarchization) stays as-is — its
 output is a plain HF dataset of `{question, hierarchical_cot,
 final_answer, ...}` records, which the JAX path consumes through a
 thin `dataset.py` adapter in Phase 2.
 
+### Trigger token: `<return|>` (decided)
+
+The prune is signalled by a single custom `<return|>` token registered
+into an unused `<unusedN>` SentencePiece slot.  Rationale:
+
+- The underlying cache surgery (rewind `end_index` + re-forward
+  summary) is the tested, trigger-agnostic mechanism.  The choice of
+  trigger does not affect correctness.
+- A single token is the cheapest representation (1 token per prune
+  vs ~15-30 for a tool-call JSON payload) — best compression ratio.
+- Upstream Gemma 4's `_Gemma4SpecialTokens` enum does not (yet)
+  define `CUSTOM`, but the SentencePiece binary still ships
+  `<unusedN>` slots; our `setup.py` patches around the missing enum
+  member once and moves on.
+- The tool-call alternative (model emits `<|tool_call>{"name":
+  "prune","summary":"..."}<|tool_call|>`) was considered and rejected
+  for Phase 1.  It would lean on Gemma 4's pre-trained tool-use
+  behaviour but at a significant token-budget cost and with heavier
+  SFT plumbing.  The cost/benefit didn't favour it enough to switch.
+- `<|channel>` and `<channel|>` (native Gemma 4 pieces) remain the
+  open/close delimiters of sub-chain-of-thought blocks; `<return|>`
+  marks the prune event at the end.
+
 ---
 
 ### Phase 1 — Prune mechanism produces bit-equivalent output to stock sampler
 
-**Goal.** Implement the pruning hook and prove it is a no-op when no
-`<return|>` is generated.  On a standard Gemma 4 E4B prompt, the new
-`HierarchicalGemma4Sampler` must yield the same tokens (or, with bf16,
-numerically equivalent logits) as the stock `Gemma4Sampler` run with
-the same seed.  Side goal: learn whether the DeepMind `Gemma4` model
-definition needs any changes to accommodate our pruning (e.g. a
-position-reset hook, a cache-mask rebuild), or whether `end_index`
-rewind is self-sufficient.
+**Goal.** Implement the pruning hook as a subclass of
+`gm.text.ChatSampler` and prove it is a no-op when no `<return|>` is
+generated.  On a standard Gemma 4 E4B prompt, `PruningChatSampler`
+must yield the same tokens (or, with bf16, numerically equivalent
+logits) as the stock `ChatSampler` run with the same seed.  Side
+goal: learn whether the `Gemma4` model definition needs any changes
+to accommodate our pruning (expected: none — confirm empirically).
 
 **Work.**
 
 1. **`setup.py`**: `gm.text.Gemma4Tokenizer(..., custom_tokens={N:
    "<return|>"})` for an unused slot `N`.  Resolve `<|channel>`,
    `<channel|>` IDs via `tokenizer.encode(...)`; assert single-token.
-   If any of the three does not resolve to one ID, we fall back to
-   short-sequence matching in the stack bookkeeping (document the
-   branch, do not mask it).
-2. **`prune_sampler.py`**: wrap `Gemma4Sampler` so generation drives
-   through `SamplerLoop._stream_sample_loop`.  Maintain a Python-side
-   stack of open-channel positions per batch element.  On each yielded
-   step:
-   - push on `<|channel>`, record close on `<channel|>`, pop + prune
-     on `<return|>`.
-   - prune = rewind `state.cache[layer]['end_index']` to `open_pos`
-     for every layer, set `state.last_token_pos = open_pos`, shift
-     `state.predicted_tokens[:, close_pos+1:step]` left to
-     `[:, open_pos:]`, zero the tail.
+   Patch around the missing `_Gemma4SpecialTokens.CUSTOM` enum
+   member (upstream oversight).
+
+2. **`prune_sampler.py`**: `PruningChatSampler` subclasses
+   `gm.text.ChatSampler`.  Override `chat(...)` to drive a segmented
+   sampling loop:
+   - Build the underlying `SamplerLoop` with `end_tokens =
+     (EOS, END_OF_TURN, BEGIN_OF_TOOL_RESPONSE, return_id, ...stop)`.
+   - Iterate: run the JIT-compiled `SamplerLoop._sample_loop` until
+     one of those fires; inspect `state.last_token[0]`.
+     - If it's `return_id`: reconstruct the matching `<|channel>` /
+       `<channel|>` positions by scanning `predicted_tokens[0,
+       :state.step]` with a simple balanced-bracket stack walk; apply
+       the prune (rewind every layer's `end_index` to `open_pos` via
+       `state.cache_info.set_end_index`, re-forward the summary one
+       token at a time, sample `next_token` from the post-summary
+       logits, collapse `predicted_tokens` so the pruned trace is
+       `[..., summary, next_token, 0, ...]`, reset `state.done` to
+       all-False).  Loop.
+     - Otherwise: exit.  `ChatSampler.chat` then records the
+       (prompt, response) turn and stashes `last_state` per its normal
+       flow.
+   - When pruning is disabled, skip the segment loop entirely and
+     delegate straight to `super().chat(...)` — byte-identical
+     to stock `ChatSampler`.
+
 3. **`scripts/gemma_jax_verify.py`** — three tests gated in order:
    - *`--test token_init`*: tokenizer custom-token registration and
      marker-ID discovery succeed.
    - *`--test sampler_noop`*: run a prompt that emits ordinary text
-     (no channel markers) through both `Gemma4Sampler` and
-     `HierarchicalGemma4Sampler` with the same seed and prefill.
-     Assert identical token streams (or, for bf16, assert
-     logit-cosine > 0.9999 at every step).  This is the "does not
-     break anything" gate.
-   - *`--test prune_parity`*: hand-construct
-     `[prompt, <|channel>, thought, <channel|>, summary, <return|>]`,
-     feed through the sampler to trigger a prune, force-continue one
-     more token.  Compare against a reference `model(...)` forward on
-     `[prompt, summary]`.  Accept cosine > 0.99 and top-1 agreement.
+     (no channel markers) through both stock `ChatSampler` and
+     `PruningChatSampler` with the same seed and prefill.  Assert
+     identical token streams (or, for bf16, assert logit-cosine >
+     0.9999 at every step).  This is the "does not break anything"
+     gate.
+   - *`--test prune_parity`*: hand-construct `[prompt, <|channel>,
+     thought, <channel|>, summary, <return|>]`, feed through the
+     sampler to trigger a prune, force-continue one more token.
+     Compare against a reference `model(...)` forward on `[prompt,
+     summary]`.  Accept cosine > 0.99 and top-1 agreement.
 4. **`scripts/gemma_jax_sample.py`**: CLI to run a prompt with
    pruning on vs off.  Human-readable smoke test; not asserted, but
    must produce coherent output in both modes.
 
 **Deliverables.**  `lib/gemma_jax/{setup,markers,prune_sampler}.py`,
 two scripts above, a short write-up naming any model-definition
-change needed (expected: none; confirm empirically).
+change needed.
 
 **Gate to Phase 2.**  All three `verify.py` tests pass.  If
 `sampler_noop` fails, Phase 1 is not done — the prune code is
 corrupting normal generation somehow.
+
+**Status note.**  A first implementation shipped on commit `c15bc89`
+using `gm.text.Sampler` (text-only, batch=1) + a Python per-token
+streaming loop.  That version is functionally correct but (a)
+inherits from the wrong base (should be `ChatSampler` for multi-turn
+/ multimodal compatibility) and (b) pays host/device sync per token.
+Refactoring it to the segmented `ChatSampler` subclass described above
+is the outstanding Phase 1 task before the verify script is run.
 
 ---
 
@@ -324,7 +376,7 @@ reward-hacking modes (empty thought blocks, trivial summaries).
      capacity / JAX depth.  **Default recommendation: Option B**
      because the GRPO worker exists and RL is where bugs multiply.
 3. **Sampling during RL**: the rollout sampler must be the Phase-1
-   `HierarchicalGemma4Sampler` so the reward function sees the
+   `PruningChatSampler` so the reward function sees the
    post-prune trajectory.  This is the non-negotiable coupling
    between phases.
 
