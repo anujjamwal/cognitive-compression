@@ -259,17 +259,18 @@ def _forward_logits(model, params, token_ids: list[int], *, cache_length: int):
     tokens = jnp.asarray([token_ids], dtype=jnp.int32)
     L = tokens.shape[1]
     positions = jnp.arange(L, dtype=jnp.int32)[None, :]
-    attn = jnp.concatenate(
-        [jnp.ones((1, L), dtype=jnp.bool_),
-         jnp.zeros((1, cache_length - L), dtype=jnp.bool_)],
-        axis=-1,
-    )
+    # Causal prefill mask: token at input position i (0..L) can attend to
+    # cache position j iff j <= i. Shape (1, L, cache_length) per Gemma 4's
+    # `*B L_with_mm cache_length` signature.
+    i_idx = jnp.arange(L, dtype=jnp.int32)[:, None]
+    j_idx = jnp.arange(cache_length, dtype=jnp.int32)[None, :]
+    attention_mask = (j_idx <= i_idx)[None, :, :]
     out = model.apply(
         {"params": params},
         tokens=tokens,
         cache=cache,
         positions=positions,
-        attention_mask=attn[:, None, :],
+        attention_mask=attention_mask,
     )
     return out.logits[0, -1]
 
@@ -307,17 +308,23 @@ def _teacher_forced_prune_logits(
     )
     tokens = jnp.asarray([full_ids], dtype=jnp.int32)
     positions = jnp.arange(L, dtype=jnp.int32)[None, :]
+    # `attn_full` is the per-cache-position validity mask used by the
+    # per-token re-forward loop below (shape (1, cache_length)). The
+    # prefill itself needs a causal mask of shape (1, L, cache_length).
     attn_full = jnp.concatenate(
         [jnp.ones((1, L), dtype=jnp.bool_),
          jnp.zeros((1, cache_length - L), dtype=jnp.bool_)],
         axis=-1,
     )
+    i_idx = jnp.arange(L, dtype=jnp.int32)[:, None]
+    j_idx = jnp.arange(cache_length, dtype=jnp.int32)[None, :]
+    prefill_mask = (j_idx <= i_idx)[None, :, :]
     out = model.apply(
         {"params": params},
         tokens=tokens,
         cache=cache,
         positions=positions,
-        attention_mask=attn_full[:, None, :],
+        attention_mask=prefill_mask,
     )
     cache_full = out.cache
 

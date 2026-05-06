@@ -58,33 +58,26 @@ def make_gemma4_tokenizer(
             f"return_token_slot {return_token_slot} out of [0, 98]"
         )
 
-    # Gemma4Tokenizer is a frozen dataclass; custom_tokens is the only
-    # user-facing hook and is frozen post-init.  We set it via the normal
-    # constructor path.
+    # The base class's `_add_custom_tokens` reads `self.special_tokens.CUSTOM`
+    # to locate the slot.  Gemma 4's enum doesn't define CUSTOM, so we inject
+    # it directly onto the class.  special_tokens is a _DisplayEnumType
+    # (enum class), and Python allows adding regular class attributes to it.
+    _probe = gm.text.Gemma4Tokenizer()
+    if not hasattr(_probe.special_tokens, "CUSTOM"):
+        type(_probe.special_tokens).CUSTOM = _GEMMA4_CUSTOM_BASE
+
+    # Warm-up: load the tokenizer once without custom tokens to initialise the
+    # sentencepiece C++ runtime on macOS/arm64.  A cold call to
+    # spm.LoadFromSerializedProto() with a modified proto crashes with
+    # "mutex lock failed: Invalid argument" until the C++ layer has been
+    # initialised via at least one plain Load / LoadFromSerializedProto call.
+    _ = _probe._sp  # noqa: SLF001
+
+    # Now create the tokenizer with the custom token registered.
     tok = gm.text.Gemma4Tokenizer(
         custom_tokens={return_token_slot: RETURN_TOKEN},
     )
-
-    # The base class's `_add_custom_tokens` reads `self.special_tokens.CUSTOM`
-    # to locate the slot.  Gemma 4's enum doesn't define CUSTOM, so we
-    # monkey-patch it on the instance-level `special_tokens` proxy before the
-    # SentencePiece processor is lazily materialized.  Accessing `._sp` below
-    # forces materialization.
-    if not hasattr(tok.special_tokens, "CUSTOM"):
-        # `special_tokens` is an enum class, not an instance — IntEnum
-        # classes resist attribute injection, so instead we set it on the
-        # module-level class via __class__.__dict__.  Simpler: rely on
-        # dataclasses.replace to shim via a subclass.
-        object.__setattr__(
-            tok,
-            "_custom_base",
-            _GEMMA4_CUSTOM_BASE,
-        )
-        # Monkey-patch _add_custom_tokens to use our override.
-        _patch_gemma4_custom_tokens(tok)
-
-    # Force SP init (which triggers proto patching).  If the upstream enum
-    # gains a CUSTOM member this path becomes a no-op.
+    # Force SP init (which triggers proto patching via upstream _add_custom_tokens).
     _ = tok._sp  # noqa: SLF001
 
     # Sanity check: round-trip the new token.
@@ -129,7 +122,7 @@ def _patch_gemma4_custom_tokens(tok: gm.text.Gemma4Tokenizer) -> None:
     This is the minimum surgery needed to make `custom_tokens={N: '<return|>'}`
     work on Gemma 4 until upstream adds `_Gemma4SpecialTokens.CUSTOM`.
     """
-    import sentencepiece_model_pb2  # type: ignore
+    from sentencepiece import sentencepiece_model_pb2  # type: ignore
 
     def _add_custom_tokens(serialized_proto: bytes) -> bytes:
         proto = sentencepiece_model_pb2.ModelProto()

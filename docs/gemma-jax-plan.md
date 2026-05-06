@@ -280,13 +280,42 @@ change needed.
 `sampler_noop` fails, Phase 1 is not done — the prune code is
 corrupting normal generation somehow.
 
-**Status note.**  A first implementation shipped on commit `c15bc89`
-using `gm.text.Sampler` (text-only, batch=1) + a Python per-token
-streaming loop.  That version is functionally correct but (a)
-inherits from the wrong base (should be `ChatSampler` for multi-turn
-/ multimodal compatibility) and (b) pays host/device sync per token.
-Refactoring it to the segmented `ChatSampler` subclass described above
-is the outstanding Phase 1 task before the verify script is run.
+**Status note (verified 2026-05-06).**  Phase 1 is complete on Gemma 4
+E4B-IT, run on Modal (A100-80GB).  All three `gemma_jax_verify.py`
+tests pass:
+
+* `token_init` — `<|channel>`=100, `<channel|>`=101, `<return|>`=6,
+  all round-trip to single ids on the 262144-vocab Gemma 4 tokenizer.
+* `sampler_noop` — stock `gm.text.ChatSampler` and
+  `PruningChatSampler(pruning_enabled=True)` emit byte-identical
+  token streams (40/40 match) on a no-marker prompt.
+* `prune_parity` — hand-crafted cache-rewind logic produces logits
+  with cosine = 1.000000 and matching top-1 against a reference
+  `[prompt, summary]` forward.
+
+The implementation history: commit `c15bc89` shipped a first version
+inheriting from `gm.text.Sampler` with a per-token streaming loop;
+commit `47eac01` refactored it onto the `ChatSampler` segmented-JIT
+base described above.  The verify run uncovered two real bugs that
+were fixed in the harness:
+
+* Two prefill sites in `gemma_jax_verify.py` (`_forward_logits` and
+  `_teacher_forced_prune_logits`) constructed an attention mask of
+  shape `(1, 1, cache_length)` instead of the
+  `(1, L, cache_length)` causal mask Gemma 4's signature requires.
+* The verify script's `--test all` path leaked GPU memory across
+  tests; on E4B the second `load_params` OOMed even on A100-80GB.
+  Fixed by running each test in its own subprocess via
+  `scripts/_gemma_jax_verify_runner.py` (Modal-side wrapper).
+
+Modal infrastructure: `scripts/modal_verify_gemma_jax.py` builds a
+JAX-CUDA image and ships verify on a single A100-80GB.  GCE
+metadata-service auth probes are explicitly suppressed
+(`GOOGLE_AUTH_DISABLE_GCE_METADATA_LOOKUP=1`,
+`GCE_METADATA_HOST=disabled`) so anonymous GCS reads of
+`gs://gemma-data/...` succeed immediately without 60s probe stalls.
+
+Phase 2 may begin.
 
 ---
 
