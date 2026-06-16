@@ -1,0 +1,36 @@
+name: cognitive-compression-jax
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # The DeepMind gemma package requires Python >= 3.12.
+  - python=3.12
+  - numpy
+  - scipy
+  - matplotlib
+  - pandas
+  - tqdm
+  - jupyter
+  - pip
+  - pip:
+      # Core: JAX + Flax + the gemma library.
+      - jax
+      - flax
+      - optax
+      - einops
+      # gemma repo is JAX-only; it pins compatible jax/flax versions in its own pyproject.
+      - "gemma @ git+https://github.com/google-deepmind/gemma"
+      # Kauldron provides the Trainer, sharding, LoRA init-transforms, and
+      # loss helpers that the Phase 2+ SFT script will build on.
+      - kauldron
+      # Datasets + tokenizer helpers reused by lib/gemma/dataprep.
+      - datasets
+      - sentencepiece
+      - tokenizers
+      # Teacher LLM for the hierarchization step (lib/gemma/dataprep/segment.py).
+      - google-genai
+      # Observability and retries.
+      - wandb
+      - tenacity
+      # Answer-correctness reward (Phase 3).
+      - math-verify
